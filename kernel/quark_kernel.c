@@ -1,28 +1,26 @@
 /*
- * Quark Anticheat - Reference Kernel Module (C)
+ * Quark Anticheat - Real Kernel Module (C)
  * 
- * This file serves as a reference implementation of the Ring 0 component 
- * of Quark Anticheat. It uses Linux Security Modules (LSM) hooks to intercept 
- * process memory access (like ptrace or /proc/PID/mem writes) and blocks 
- * unauthorized attempts.
- * 
- * Note: Compiling and loading this module requires kernel headers and root privileges.
+ * This file implements the Ring 0 component of Quark Anticheat.
+ * It uses kretprobes to dynamically hook ptrace_may_access, blocking
+ * unauthorized attempts to read or write the memory of protected processes
+ * (such as writing to /proc/PID/mem or attaching via ptrace).
  */
 
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
-#include <linux/lsm_hooks.h>
-#include <linux/security.h>
+#include <linux/ptrace.h>
+#include <linux/kprobes.h>
 #include <linux/netlink.h>
 #include <linux/skbuff.h>
 #include <net/sock.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Martinez Alarcon, Gabriel Sebastian & Merino De Rui, Stefano Nahuel");
-MODULE_DESCRIPTION("Quark Anticheat - Ring 0 Security Module (LSM & Netlink)");
-MODULE_VERSION("0.1.0");
+MODULE_DESCRIPTION("Quark Anticheat - Ring 0 Security Module (kretprobes & Netlink)");
+MODULE_VERSION("0.2.0");
 
 #define NETLINK_QUARK 31  // Custom netlink protocol number
 #define MAX_PROTECTED_PROCESSES 16
@@ -54,7 +52,6 @@ static void add_protected_pid(pid_t pid) {
     unsigned long flags;
     spin_lock_irqsave(&quark_lock, flags);
     if (protected_pids_count < MAX_PROTECTED_PROCESSES) {
-        // Check if already present
         int i;
         bool exists = false;
         for (i = 0; i < protected_pids_count; i++) {
@@ -90,32 +87,58 @@ static void remove_protected_pid(pid_t pid) {
 }
 
 /*
- * LSM Hook: Intercepts process attachment or memory access checks.
- * Under Linux, opening /proc/<PID>/mem or calling process_vm_writev/ptrace
- * triggers a security_ptrace_access_check.
+ * Entry handler: runs before ptrace_may_access executes.
+ * We extract the first argument (struct task_struct *task) and save it in ri->data.
+ * Under x86_64, the first argument is passed in the DI register (regs->di).
  */
-static int quark_ptrace_access_check(struct task_struct *child, unsigned int mode) {
-    pid_t target_pid = task_pid_vnr(child);
-    pid_t parent_pid = task_pid_vnr(current);
+static int ptrace_may_access_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+#ifdef CONFIG_X86_64
+    struct task_struct *task = (struct task_struct *)regs->di;
+    *((struct task_struct **)ri->data) = task;
+#else
+    *((struct task_struct **)ri->data) = NULL;
+#endif
+    return 0;
+}
 
-    // If the target process is protected by Quark
-    if (is_pid_protected(target_pid)) {
-        // Allow the process to access its own memory
-        if (target_pid == parent_pid) {
-            return 0; 
-        }
+/*
+ * Return handler: runs after ptrace_may_access finishes.
+ * We inspect if the target task is protected. If so, and the caller is not
+ * the process itself, we override the return value (rax) to 0 (false/access denied).
+ */
+static int ptrace_may_access_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct task_struct *task = *((struct task_struct **)ri->data);
+    pid_t target_pid;
+    pid_t parent_pid;
 
-        // Block all other processes from accessing this process's memory/debugging it
-        pr_warn("[QUARK-KERNEL ALERT] Blocked access to protected process %d by PID %d (Mode: %u)\n", 
-                target_pid, parent_pid, mode);
-        
-        // Return Access Denied
-        return -EACCES; 
+    if (!task) {
+        return 0;
     }
 
-    // Default allow for other processes
-    return 0; 
+    target_pid = task_pid_vnr(task);
+    parent_pid = task_pid_vnr(current);
+
+    if (is_pid_protected(target_pid)) {
+        // Allow the process to access itself, block others
+        if (target_pid != parent_pid) {
+            pr_warn("[QUARK-KERNEL ALERT] Blocked memory/ptrace access to protected process %d by PID %d!\n", 
+                    target_pid, parent_pid);
+            
+#ifdef CONFIG_X86_64
+            // Override rax register (return value) to 0 (false)
+            regs->ax = 0;
+#endif
+        }
+    }
+    return 0;
 }
+
+static struct kretprobe quark_kretprobe = {
+    .handler = ptrace_may_access_ret_handler,
+    .entry_handler = ptrace_may_access_entry_handler,
+    .data_size = sizeof(struct task_struct *),
+    .maxactive = 64,
+};
 
 /*
  * Netlink receiver callback. Receives commands from userspace daemon.
@@ -128,7 +151,6 @@ static void quark_nl_recv_msg(struct sk_buff *skb) {
     nlh = (struct nlmsghdr *)skb->data;
     msg_type = nlh->nlmsg_type;
     
-    // Payload contains the target PID
     if (nlmsg_len(nlh) < sizeof(int)) {
         pr_err("[QUARK-KERNEL] Netlink payload too small\n");
         return;
@@ -149,15 +171,11 @@ static void quark_nl_recv_msg(struct sk_buff *skb) {
     }
 }
 
-// Registering LSM Hooks (Modern Linux Kernel format)
-static struct security_hook_list quark_hooks[] __lsm_ro_after_init = {
-    LSM_HOOK_INIT(ptrace_access_check, quark_ptrace_access_check),
-};
-
 static int __init quark_kernel_init(void) {
     struct netlink_kernel_cfg cfg = {
         .input = quark_nl_recv_msg,
     };
+    int ret;
 
     pr_info("[QUARK-KERNEL] Initializing Quark Anticheat Kernel Module...\n");
 
@@ -169,29 +187,29 @@ static int __init quark_kernel_init(void) {
     }
     pr_info("[QUARK-KERNEL] Netlink socket created successfully.\n");
 
-    // 2. Register security hooks
-    // In a real kernel compilation, the LSM module is initialized during boot. 
-    // Here we simulate the registration.
-#ifdef CONFIG_SECURITY
-    security_add_hooks(quark_hooks, ARRAY_SIZE(quark_hooks), "quark");
-    pr_info("[QUARK-KERNEL] LSM security hooks registered successfully.\n");
-#else
-    pr_warn("[QUARK-KERNEL] CONFIG_SECURITY not enabled, LSM hooks could not be registered.\n");
-#endif
-
+    // 2. Register kretprobe
+    quark_kretprobe.kp.symbol_name = "ptrace_may_access";
+    ret = register_kretprobe(&quark_kretprobe);
+    if (ret < 0) {
+        pr_err("[QUARK-KERNEL] Failed to register kretprobe on ptrace_may_access: %d\n", ret);
+        netlink_kernel_release(nl_socket);
+        return ret;
+    }
+    
+    pr_info("[QUARK-KERNEL] Successfully registered kretprobe on ptrace_may_access.\n");
     return 0;
 }
 
 static void __exit quark_kernel_exit(void) {
     pr_info("[QUARK-KERNEL] Exiting Quark Anticheat Kernel Module...\n");
 
+    // Unregister kretprobe
+    unregister_kretprobe(&quark_kretprobe);
+
     // Release netlink socket
     if (nl_socket) {
         netlink_kernel_release(nl_socket);
     }
-
-    // Hooks are typically not removed dynamically in modern LSM architectures to prevent security bypasses,
-    // but in standard kernel modules they would be cleaned up if supported.
 }
 
 module_init(quark_kernel_init);

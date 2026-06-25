@@ -25,9 +25,9 @@ graph TD
 ```
 
 1. **Módulo de Kernel (Ring 0):**
-   * Escrito en C y Rust (apoyado en *Rust for Linux*).
+   * Escrito en C (con opción de portado a Rust via *Rust for Linux*).
    * Monitorea llamadas al sistema, procesos activos y accesos a memoria.
-   * Utiliza el framework **LSM (Linux Security Modules)** para interceptar y bloquear operaciones sensibles (como `ptrace` o apertura de `/proc/<PID>/mem` por parte de procesos no autorizados).
+   * Utiliza el framework **LSM (Linux Security Modules)** para interceptación estática interna y sondas dinámicas **kretprobes** (sobre funciones críticas como `ptrace_may_access`) para bloquear operaciones sensibles (como `ptrace` o apertura de `/proc/<PID>/mem` por parte de procesos no autorizados) de forma dinámica sin depender de funciones no exportadas.
    * Utiliza programas **eBPF (Extended Berkeley Packet Filter)** para capturar telemetría con muy bajo overhead.
    * Se comunica con el espacio de usuario a través de Netlink Sockets.
 

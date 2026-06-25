@@ -52,14 +52,12 @@ fn bytes_to_u64(buf: &[u8], size: u32) -> u64 {
 fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
     println!("[QUARK-DAEMON] Client connected.");
     
-    // We will initialize the state when we receive CMD_REGISTER_GAME
     let state: Arc<Mutex<Option<QuarkState>>> = Arc::new(Mutex::new(None));
     let state_clone = Arc::clone(&state);
     
     let mut header_buf = [0u8; 8];
     
     loop {
-        // Read packet header (command: u32, payload_len: u32)
         if let Err(e) = stream.read_exact(&mut header_buf) {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 println!("[QUARK-DAEMON] Client disconnected (EOF).");
@@ -83,6 +81,25 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                 let pid = i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 println!("[QUARK-DAEMON] Registering game process with PID: {}", pid);
                 
+                // 1. Tell kernel module to PROTECT this PID
+                println!("[QUARK-DAEMON] Registering PID {} to Ring 0 Module...", pid);
+                let output = Command::new("sudo")
+                    .args(&["./quark_daemon/quark_cli", "1", &pid.to_string()])
+                    .output();
+                match output {
+                    Ok(out) => {
+                        let stdout_str = String::from_utf8_lossy(&out.stdout);
+                        let stderr_str = String::from_utf8_lossy(&out.stderr);
+                        print!("[QUARK-DAEMON] Kernel Registration output: {}", stdout_str);
+                        if !out.status.success() {
+                            eprintln!("[QUARK-DAEMON] Kernel Registration stderr: {}", stderr_str);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[QUARK-DAEMON] Failed to execute quark_cli: {:?}", e);
+                    }
+                }
+                
                 let mut lock = state.lock().unwrap();
                 *lock = Some(QuarkState {
                     pid,
@@ -90,7 +107,7 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                     is_active: true,
                 });
                 
-                // Spawn the monitoring thread
+                // Spawn the monitoring thread (runs in user-space as redundancy / logging)
                 let state_for_thread = Arc::clone(&state);
                 thread::spawn(move || {
                     if let Err(e) = run_monitor_loop(state_for_thread) {
@@ -110,7 +127,6 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                 ]);
                 let size = u32::from_ne_bytes([payload[8], payload[9], payload[10], payload[11]]);
                 
-                // Extract 32 bytes for name
                 let name_bytes = &payload[12..44];
                 let name = String::from_utf8_lossy(name_bytes)
                     .trim_matches('\0')
@@ -121,9 +137,9 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                     name, address, size
                 );
                 
-                // Let's read the initial value from the game's memory
                 let mut lock = state.lock().unwrap();
                 if let Some(ref mut s) = *lock {
+                    // Try to read initial value
                     let mem_path = format!("/proc/{}/mem", s.pid);
                     let initial_value = match File::open(&mem_path) {
                         Ok(mut f) => {
@@ -134,16 +150,13 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                                     println!("[QUARK-DAEMON] Read initial value for '{}': {}", name, val);
                                     val
                                 } else {
-                                    println!("[QUARK-DAEMON] Failed to read memory for initial value");
                                     0
                                 }
                             } else {
-                                println!("[QUARK-DAEMON] Failed to seek to address 0x{:X}", address);
                                 0
                             }
                         }
-                        Err(e) => {
-                            println!("[QUARK-DAEMON] Failed to open {}: {:?}", mem_path, e);
+                        Err(_) => {
                             0
                         }
                     };
@@ -173,10 +186,7 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                 let mut lock = state.lock().unwrap();
                 if let Some(ref mut s) = *lock {
                     if let Some(var) = s.variables.get_mut(&address) {
-                        // Let's update the cache
                         var.expected_value = new_value;
-                        // Optional debug print (uncomment if needed, but keeping it clean)
-                        // println!("[QUARK-DAEMON] Expected value of '{}' updated to {}", var.name, new_value);
                     }
                 }
             }
@@ -186,18 +196,22 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
         }
     }
     
-    // Cleanup
+    // Cleanup: Unprotect the PID from the kernel module
     let mut lock = state_clone.lock().unwrap();
     if let Some(ref mut s) = *lock {
         s.is_active = false;
-        println!("[QUARK-DAEMON] Monitoring session ended for PID {}.", s.pid);
+        let pid = s.pid;
+        println!("[QUARK-DAEMON] Unregistering PID {} from Ring 0 Module...", pid);
+        let _ = Command::new("sudo")
+            .args(&["./quark_daemon/quark_cli", "2", &pid.to_string()])
+            .status();
+        println!("[QUARK-DAEMON] Monitoring session ended for PID {}.", pid);
     }
     
     Ok(())
 }
 
 fn run_monitor_loop(state: Arc<Mutex<Option<QuarkState>>>) -> std::io::Result<()> {
-    // Wait a brief moment for registration of variables
     thread::sleep(Duration::from_millis(100));
     
     let pid = {
@@ -215,7 +229,7 @@ fn run_monitor_loop(state: Arc<Mutex<Option<QuarkState>>>) -> std::io::Result<()
     let mut mem_file = match File::open(&mem_path) {
         Ok(f) => f,
         Err(e) => {
-            println!("[QUARK-MONITOR] Error: Could not open {}: {:?}", mem_path, e);
+            println!("[QUARK-MONITOR] Warning: Could not open {}: {:?}", mem_path, e);
             return Err(e);
         }
     };
@@ -248,13 +262,7 @@ fn run_monitor_loop(state: Arc<Mutex<Option<QuarkState>>>) -> std::io::Result<()
                         println!("==================================================");
                         
                         println!("[QUARK ACTION] Terminating target process {} immediately...", pid);
-                        let kill_res = Command::new("kill")
-                            .args(&["-9", &pid.to_string()])
-                            .status();
-                        match kill_res {
-                            Ok(status) => println!("[QUARK ACTION] Process terminated. Kill status: {}", status),
-                            Err(e) => println!("[QUARK ACTION] Failed to terminate process: {:?}", e),
-                        }
+                        let _ = Command::new("kill").args(&["-9", &pid.to_string()]).status();
                         
                         s.is_active = false;
                         break;

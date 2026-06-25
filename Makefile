@@ -14,6 +14,8 @@ all: daemon game cheat
 daemon:
 	@echo "=== Compiling Quark Daemon (Rust) ==="
 	cargo build --release --manifest-path $(DAEMON_DIR)/Cargo.toml
+	@echo "=== Compiling Quark Netlink CLI Client (C) ==="
+	$(CC) $(CFLAGS) $(DAEMON_DIR)/quark_cli.c -o $(DAEMON_DIR)/quark_cli
 
 game: $(GAME_DIR)/game.c $(SDK_DIR)/quark_sdk.c
 	@echo "=== Compiling Game & SDK (C) ==="
@@ -26,6 +28,8 @@ cheat: $(CHEAT_DIR)/cheat.c
 clean:
 	@echo "=== Cleaning Build Artifacts ==="
 	cargo clean --manifest-path $(DAEMON_DIR)/Cargo.toml
+	rm -f $(DAEMON_DIR)/quark_cli
 	rm -f $(GAME_DIR)/game
 	rm -f $(CHEAT_DIR)/cheat
 	rm -f /tmp/quark.sock
+	make -C kernel clean

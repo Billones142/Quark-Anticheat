@@ -145,3 +145,23 @@ El script [run_test_no_quark.sh](file:///home/stefano/Quark-Anticheat/run_test_n
 ```
 *Verás en el log final del juego cómo la variable 'health' pasa a valer 9999 en memoria virtual, confirmando el éxito del hack en ausencia de Quark.*
 
+### C. Prueba Real a Nivel de Kernel (Ring 0)
+El script [run_test_kernel.sh](file:///home/stefano/Quark-Anticheat/run_test_kernel.sh) demuestra el funcionamiento de Quark **directamente en el kernel** (Ring 0) utilizando el módulo recopilado:
+1. Compila los programas de espacio de usuario y el módulo de kernel en `kernel/quark_kernel.ko`.
+2. Carga el módulo de kernel (`sudo insmod kernel/quark_kernel.ko`).
+3. Inicia el Daemon de Quark.
+4. Inicia el juego. El Daemon detecta la conexión y, a través del binario auxiliar `quark_cli`, envía un comando **Netlink** al kernel para indicarle que proteja el PID del juego.
+5. El kernel añade el PID a la lista de procesos protegidos.
+6. El script ejecuta el `cheat` para intentar modificar la vida a `9999`.
+7. **Intercepción del Kernel (Kretprobe):** El cheat llama a `open("/proc/PID/mem")`. Esto activa `ptrace_may_access` en el kernel, la cual es interceptada por nuestra sonda *kretprobe*. Al notar que el objetivo es un proceso protegido por Quark y que el llamador es un proceso ajeno (el cheat), el módulo de kernel sobreescribe el retorno de la llamada a `0` (acceso denegado).
+8. El `cheat` falla con un error de lectura/escritura (`Permission denied`).
+9. El juego sigue ejecutándose de manera segura con su vida intacta en `100`.
+10. El script descarga el módulo de kernel (`sudo rmmod quark_kernel`) y muestra las alertas capturadas en `dmesg`.
+
+**Ejecución:**
+```bash
+./run_test_kernel.sh
+```
+*Este script te solicitará tu contraseña de `sudo` para poder cargar y descargar el módulo en tu máquina virtual de pruebas.*
+
+
