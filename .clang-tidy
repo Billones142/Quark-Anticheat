@@ -1,0 +1,19 @@
+---
+# Strict Clang-Tidy Configuration for Quark Anticheat
+# Focuses on preventing memory safety bugs (buffer overflows/underflows, use-after-free, etc.) and security vulnerabilities.
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  cert-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-reserved-identifier
+
+# Treat all enabled warnings as hard compile errors to enforce compliance
+WarningsAsErrors: '*'
+
+# Analyze headers only inside our project workspace, ignoring kernel system headers
+HeaderFilterRegex: '^(sdk|kernel|game_target|cheat|quark_daemon)/.*'
+
