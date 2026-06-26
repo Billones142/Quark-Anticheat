@@ -1,0 +1,17 @@
+-D__KERNEL__
+-DMODULE
+-DCC_USING_FENTRY
+-std=gnu11
+-mfentry
+-pg
+-I/lib/modules/7.0.13-zen1-1-zen/build/include
+-I/lib/modules/7.0.13-zen1-1-zen/build/arch/x86/include
+-I/lib/modules/7.0.13-zen1-1-zen/build/arch/x86/include/generated
+-I/lib/modules/7.0.13-zen1-1-zen/build/include/uapi
+-I/lib/modules/7.0.13-zen1-1-zen/build/arch/x86/include/uapi
+-I/lib/modules/7.0.13-zen1-1-zen/build/arch/x86/include/generated/uapi
+-I/lib/modules/7.0.13-zen1-1-zen/build/include/generated/uapi
+-include
+/lib/modules/7.0.13-zen1-1-zen/build/include/linux/kconfig.h
+-include
+/lib/modules/7.0.13-zen1-1-zen/build/include/linux/compiler_types.h
