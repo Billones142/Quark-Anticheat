@@ -10,7 +10,15 @@ extern "C" {
 /**
  * Initializes the Quark SDK by connecting to the Quark Daemon socket
  * and registering the current game process PID.
- * Returns 0 on success, -1 on failure.
+ *
+ * On success, also starts a background watchdog thread that keeps checking
+ * the daemon connection is still alive. If the daemon disconnects later
+ * (killed, crashed, etc.), the watchdog terminates this process immediately
+ * (process exit, not a normal shutdown) rather than letting the game keep
+ * running unsupervised.
+ *
+ * Returns 0 on success, -1 on failure (e.g. daemon not running at startup;
+ * in that case the game is expected to proceed unprotected, same as before).
  */
 int quark_sdk_init(void);
 

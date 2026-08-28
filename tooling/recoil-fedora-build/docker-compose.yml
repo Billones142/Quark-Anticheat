@@ -1,0 +1,10 @@
+services:
+  build:
+    build: .
+    image: recoil-fedora-build:44
+    container_name: recoil-fedora-build
+    volumes:
+      - ${RECOIL_ENGINE_DIR:-../../../RecoilEngine}:/src
+    # Keep the container alive so `docker compose exec` / `run.sh` can issue commands
+    # against it repeatedly without paying the dnf-install cost each time.
+    command: sleep infinity
