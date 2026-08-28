@@ -16,8 +16,9 @@
 #   scp build-fedora/AI/Skirmish/BARb/data/libSkirmishAI.so \
 #       root@<vm>:/home/quark/RecoilEngine/cont/AI/Skirmish/BARb/stable/
 #
-# RECOIL_ENGINE_DIR (env var, default: ../../../RecoilEngine relative to this script)
-# controls which source checkout gets mounted — see docker-compose.yml.
+# RECOIL_ENGINE_DIR (env var, default: ../../RecoilEngine relative to this script,
+# i.e. the RecoilEngine git submodule at the repo root) controls which source
+# checkout gets mounted — see docker-compose.yml.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
