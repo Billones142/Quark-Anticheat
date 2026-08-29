@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -117,27 +117,54 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                 let output = Command::new("sudo")
                     .args(&["./quark_daemon/quark_cli", "1", &pid.to_string()])
                     .output();
-                match output {
+                // quark_cli exits non-zero on any netlink failure (e.g. the kernel
+                // module isn't loaded), so its exit status is the actual source of
+                // truth for whether Ring 0 protection is active for this PID -- not
+                // just whether the daemon itself is reachable.
+                let kernel_ok = match &output {
                     Ok(out) => {
                         let stdout_str = String::from_utf8_lossy(&out.stdout);
-                        let stderr_str = String::from_utf8_lossy(&out.stderr);
                         print!("[QUARK-DAEMON] Kernel Registration output: {}", stdout_str);
                         if !out.status.success() {
+                            let stderr_str = String::from_utf8_lossy(&out.stderr);
                             eprintln!("[QUARK-DAEMON] Kernel Registration stderr: {}", stderr_str);
                         }
+                        out.status.success()
                     }
                     Err(e) => {
                         eprintln!("[QUARK-DAEMON] Failed to execute quark_cli: {:?}", e);
+                        false
                     }
+                };
+
+                if !kernel_ok {
+                    eprintln!(
+                        "[QUARK-DAEMON] Refusing to confirm protection for PID {}: kernel module registration failed.",
+                        pid
+                    );
                 }
-                
+
+                // Tell the client whether Ring 0 protection is actually active, so
+                // quark_sdk_init() can refuse to let the game run unprotected
+                // instead of assuming success just because the daemon answered.
+                if let Err(e) = stream.write_all(&[if kernel_ok { 1u8 } else { 0u8 }]) {
+                    eprintln!("[QUARK-DAEMON] Failed to send registration ack: {:?}", e);
+                    return Err(e);
+                }
+
+                if !kernel_ok {
+                    // Nothing left to supervise for this connection: the client's
+                    // watchdog will see the socket close and refuse to continue.
+                    break;
+                }
+
                 let mut lock = state.lock().unwrap();
                 *lock = Some(QuarkState {
                     pid,
                     variables: HashMap::new(),
                     is_active: true,
                 });
-                
+
                 // Spawn the monitoring thread (runs in user-space as redundancy / logging)
                 let state_for_thread = Arc::clone(&state);
                 thread::spawn(move || {

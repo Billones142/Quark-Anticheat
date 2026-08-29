@@ -125,6 +125,22 @@ int quark_sdk_init(void) {
         return -1;
     }
 
+    // The daemon replies with a single byte once it knows whether Ring 0
+    // (kernel module) protection was actually confirmed for our PID -- a live
+    // daemon connection alone doesn't mean the kernel module is loaded (see
+    // quark_daemon's CMD_REGISTER_GAME handler). Refuse to report success,
+    // and refuse to let the caller continue, unless that's a confirmed "yes".
+    uint8_t ack = 0;
+    ssize_t n = read(quark_socket_fd, &ack, sizeof(ack));
+    if (n != (ssize_t)sizeof(ack) || ack != 1) {
+        fprintf(stderr, "[QUARK-SDK] FATAL: kernel-level protection was not confirmed "
+                         "(daemon is reachable, but Ring 0 registration failed -- is "
+                         "quark_kernel.ko loaded?). Refusing to continue unprotected.\n");
+        close(quark_socket_fd);
+        quark_socket_fd = -1;
+        return -1;
+    }
+
     printf("[QUARK-SDK] Successfully initialized and linked to Quark Daemon (PID: %d)\n", pid);
 
     if (pthread_create(&quark_watchdog_thread, NULL, quark_watchdog_main, NULL) != 0) {
@@ -181,6 +197,13 @@ int quark_sdk_update_var(void *address, uint64_t new_value) {
     }
 
     return 0;
+}
+
+int quark_sdk_is_active(void) {
+    pthread_mutex_lock(&quark_fd_mutex);
+    int active = (quark_socket_fd != -1);
+    pthread_mutex_unlock(&quark_fd_mutex);
+    return active;
 }
 
 void quark_sdk_close(void) {
