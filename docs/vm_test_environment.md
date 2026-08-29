@@ -466,3 +466,58 @@ archive) — offered to the user as the actual next step; **declined** in favor 
 just the two genuine bug fixes above and dropping the buildings/2-metal-spot feature.
 The unused gadget file was removed from the VM (`cont/luarules/gadgets/` no longer
 exists there).
+
+## 11. Server-declared "protected match" requirement, and the ack/nack fix that made it trustworthy
+
+**Bug found first**: rebooted the VM, forgot to reload `quark_kernel.ko`, then noticed
+Cheat Engine could read the running game's memory with no errors at all. Root cause:
+`quark_sdk_init()` reported success as soon as it could write its registration packet
+into the daemon's Unix socket — proof the *daemon* was reachable, not proof the *kernel
+module* had actually accepted the PID. The daemon's `CMD_REGISTER_GAME` handler
+(`quark_daemon/src/main.rs`) shells out to `quark_cli` over netlink and logs failures to
+its own journal, but never told the connecting client. Fixed by making that handshake a
+real request/response: the daemon now replies with a single ack byte (1 = kernel
+registration confirmed via `quark_cli`'s exit status, 0 = failed), and `quark_sdk_init()`
+(`sdk/quark_sdk.c`) refuses to return success — closing the socket and printing a `FATAL`
+line — until it gets a confirmed `1`. Also added `quark_sdk_is_active()`, a cheap
+liveness getter (`quark_socket_fd != -1`, mutex-guarded) reused by the feature below.
+
+**Feature**: a host can now mark a match as requiring Quark via
+`GAME\ModOptions\RequireQuarkAnticheat` (new `CGameSetup::requireQuarkAnticheat`,
+`RecoilEngine/rts/Game/GameSetup.{h,cpp}`, following the existing
+`useLuaGaia`/`luaDevMode`/`fixedAllies` pattern). Every connecting player — including the
+host's own local client — must have confirmed Quark protection or
+`CGameServer::BindConnection` (`rts/Net/GameServer.cpp`) rejects them the same way it
+already rejects a bad password or version mismatch, before `GameData`/mod options are
+ever sent to the peer; the rejection reason string flows through the engine's existing
+`NETMSG_QUIT` → `PreGame.cpp` → `handleerror`/Lua-menu path with zero new client UI code.
+A real networked opponent's Quark status has to travel in the connect handshake itself
+(`NETMSG_ATTEMPTCONNECT` gained a `quarkActive` byte — a wire-format change scoped to
+this patched fork, not wire-compatible with unpatched upstream RecoilEngine). Purely
+local sessions (`onlyLocal`, e.g. a solo AI-vs-AI skirmish) are exempt regardless of the
+mod option, since nothing else can ever connect to them.
+
+**Validated live on the VM** (`~/RecoilEngine/build/skirmish_2ai_protected.txt` — a copy
+of `skirmish_2ai.txt` with `OnlyLocal=0` and `[MODOPTIONS]{RequireQuarkAnticheat=1;}`,
+launched via `systemd-run --uid=1001 --gid=1001` rather than plain SSH, because this VM's
+`sshd` uses `pam_namespace` to give each SSH session its own private `/tmp`, which hid
+the real `/tmp/quark.sock` from anything launched through a bare `ssh`/`su` session):
+
+- **Protected + Quark active** (module loaded): `[QUARK-SDK] Successfully initialized...`,
+  daemon journal shows `Registering PID <pid> to Ring 0 Module...` succeeding, match loads
+  normally (BARb AI scripts load as usual).
+- **Protected + Quark inactive** (`rmmod quark_kernel`): `[QUARK-SDK] FATAL: kernel-level
+  protection was not confirmed...`, and the engine immediately logs `[PreGame::
+  UpdateClientNet] server requested quit or rejected connection (reason "Connection
+  rejected: Quark Anticheat required for this match but not active on client")` — no map
+  or AI ever loads.
+- **Negative control** (plain `skirmish_2ai.txt`, no mod option, Quark still inactive):
+  match loads normally despite the `FATAL` SDK line — confirms ordinary matches are
+  completely unaffected by the new gate.
+
+Not validated in this pass: a genuine two-*process* test (one engine instance rejecting a
+second, separate engine instance connecting over the real network field) — the three
+scenarios above all exercise the host's own local connection through the same
+`BindConnection` code path a remote client would use, which covers the logic, but a real
+cross-process run would need a second VM or a second local Quark-active/inactive engine
+instance side by side, which wasn't set up here.
