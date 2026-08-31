@@ -15,15 +15,45 @@
 #include <linux/kprobes.h>
 #include <linux/netlink.h>
 #include <linux/skbuff.h>
+#include <linux/string.h>
 #include <net/sock.h>
+#ifdef CONFIG_X86_64
+#include <asm/cpufeature.h>
+#endif
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Martinez Alarcon, Gabriel Sebastian & Merino De Rui, Stefano Nahuel");
 MODULE_DESCRIPTION("Quark Anticheat - Ring 0 Security Module (kretprobes & Netlink)");
-MODULE_VERSION("0.2.0");
+MODULE_VERSION("0.3.0");
+
+#define QUARK_KERNEL_VERSION "0.3.0"
 
 #define NETLINK_QUARK 31  // Custom netlink protocol number
 #define MAX_PROTECTED_PROCESSES 16
+
+// Reply to a "protect PID" request, sent back to the requesting quark_cli over
+// the same Netlink socket. Lets userspace (and, through the daemon/SDK chain,
+// the protected game itself) know whether protection actually took effect,
+// and whether this .ko was built with the VM-detection bypass compiled in --
+// a testing build must never be able to pass itself off as a full release build.
+struct quark_protect_response {
+    u8   ok;                 // 1 = protection registered, 0 = refused
+    u8   is_testing_build;   // 1 = built with QUARK_TESTING_BUILD
+    u8   reserved[2];
+    char version[16];        // QUARK_KERNEL_VERSION, NUL-padded
+};
+
+// Returns true if this kernel is running as a hypervisor guest (KVM, VMware,
+// VirtualBox, Hyper-V, Xen HVM, ...), via the CPUID "hypervisor present" bit
+// (leaf 1, ECX bit 31) that all of those set for the guest. Checked in Ring 0
+// so it can't be spoofed by anything running in userspace.
+static bool quark_running_in_vm(void) {
+#ifdef CONFIG_X86_64
+    return boot_cpu_has(X86_FEATURE_HYPERVISOR);
+#else
+    return false;
+#endif
+}
 
 static struct sock *nl_socket = NULL;
 static pid_t protected_pids[MAX_PROTECTED_PROCESSES];
@@ -68,6 +98,63 @@ static void add_protected_pid(pid_t pid) {
         pr_warn("[QUARK-KERNEL] Protected PID table full, cannot protect PID %d\n", pid);
     }
     spin_unlock_irqrestore(&quark_lock, flags);
+}
+
+// Attempts to protect a PID, subject to the VM check below. Returns true if
+// protection was actually registered.
+//
+// Release builds (QUARK_TESTING_BUILD not defined) refuse outright when a
+// hypervisor is detected -- this branch's #else is the only place that ever
+// calls add_protected_pid() after a positive quark_running_in_vm(), so a
+// release .ko simply does not contain a code path that would let it protect
+// a PID inside a VM, regardless of anything userspace sends it.
+static bool quark_protect_pid(pid_t pid) {
+    if (quark_running_in_vm()) {
+#ifdef QUARK_TESTING_BUILD
+        pr_warn("[QUARK-KERNEL] TESTING BUILD: hypervisor detected, VM check bypassed for PID %d\n", pid);
+#else
+        pr_err("[QUARK-KERNEL] Refusing to protect PID %d: hypervisor detected (this is a release build)\n", pid);
+        return false;
+#endif
+    }
+    add_protected_pid(pid);
+    return true;
+}
+
+// Sends a quark_protect_response back to the requesting quark_cli over the
+// same Netlink socket.
+static void quark_send_protect_response(u32 dest_pid, bool ok) {
+    struct sk_buff *skb_out;
+    struct nlmsghdr *nlh;
+    struct quark_protect_response resp;
+    int msg_size = sizeof(resp);
+
+    memset(&resp, 0, sizeof(resp));
+    resp.ok = ok ? 1 : 0;
+#ifdef QUARK_TESTING_BUILD
+    resp.is_testing_build = 1;
+#else
+    resp.is_testing_build = 0;
+#endif
+    strscpy(resp.version, QUARK_KERNEL_VERSION, sizeof(resp.version));
+
+    skb_out = nlmsg_new(msg_size, GFP_KERNEL);
+    if (!skb_out) {
+        pr_err("[QUARK-KERNEL] Failed to allocate response skb for pid %d\n", dest_pid);
+        return;
+    }
+
+    nlh = nlmsg_put(skb_out, 0, 0, NLMSG_DONE, msg_size, 0);
+    if (!nlh) {
+        pr_err("[QUARK-KERNEL] Failed to build response nlmsghdr for pid %d\n", dest_pid);
+        kfree_skb(skb_out);
+        return;
+    }
+    memcpy(nlmsg_data(nlh), &resp, msg_size);
+
+    if (nlmsg_unicast(nl_socket, skb_out, dest_pid) < 0) {
+        pr_warn("[QUARK-KERNEL] Failed to send protect response to pid %d\n", dest_pid);
+    }
 }
 
 // Remove a PID from the protected list
@@ -159,9 +246,11 @@ static void quark_nl_recv_msg(struct sk_buff *skb) {
     pid = *(int *)nlmsg_data(nlh);
 
     switch (msg_type) {
-        case 1: // Command: Protect PID
-            add_protected_pid(pid);
+        case 1: { // Command: Protect PID
+            bool ok = quark_protect_pid(pid);
+            quark_send_protect_response(nlh->nlmsg_pid, ok);
             break;
+        }
         case 2: // Command: Unprotect PID
             remove_protected_pid(pid);
             break;

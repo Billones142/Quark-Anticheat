@@ -39,6 +39,11 @@ int main(void) {
     if (quark_sdk_init() == -1) {
         printf("[GAME] WARNING: Quark Anticheat Daemon not detected. Running without protection.\n");
     } else {
+        char version[32];
+        quark_sdk_get_version(version, sizeof(version));
+        printf("[GAME] Quark kernel version: %s (testing build: %d)\n",
+               version, quark_sdk_is_testing_build());
+
         // 3. Register target variables
         quark_sdk_register_var(&health, sizeof(health), "health");
         quark_sdk_register_var(&score, sizeof(score), "score");

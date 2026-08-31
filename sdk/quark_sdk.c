@@ -21,6 +21,15 @@ static int quark_socket_fd = -1;
 static pthread_mutex_t quark_fd_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t quark_watchdog_thread;
 
+// Reported by the daemon (originally the kernel module) alongside the
+// registration ack. Guarded by quark_fd_mutex like quark_socket_fd, since
+// they're only meaningful together (both reset when the connection drops).
+static int quark_is_testing_build = 0;
+static char quark_kernel_version[17] = "";
+
+// Wire layout of the daemon's CMD_REGISTER_GAME reply: [ok:1][is_testing_build:1][version:16].
+#define QUARK_REGISTER_ACK_SIZE 18
+
 static int send_packet(uint32_t command, const void *payload, uint32_t payload_len) {
     if (quark_socket_fd == -1) {
         return -1;
@@ -125,23 +134,35 @@ int quark_sdk_init(void) {
         return -1;
     }
 
-    // The daemon replies with a single byte once it knows whether Ring 0
-    // (kernel module) protection was actually confirmed for our PID -- a live
-    // daemon connection alone doesn't mean the kernel module is loaded (see
-    // quark_daemon's CMD_REGISTER_GAME handler). Refuse to report success,
-    // and refuse to let the caller continue, unless that's a confirmed "yes".
-    uint8_t ack = 0;
-    ssize_t n = read(quark_socket_fd, &ack, sizeof(ack));
-    if (n != (ssize_t)sizeof(ack) || ack != 1) {
+    // The daemon replies with [ok][is_testing_build][version:16] once it knows
+    // whether Ring 0 (kernel module) protection was actually confirmed for our
+    // PID -- a live daemon connection alone doesn't mean the kernel module is
+    // loaded (see quark_daemon's CMD_REGISTER_GAME handler). Refuse to report
+    // success, and refuse to let the caller continue, unless that's a
+    // confirmed "yes".
+    uint8_t ack[QUARK_REGISTER_ACK_SIZE];
+    ssize_t n = read(quark_socket_fd, ack, sizeof(ack));
+    if (n != (ssize_t)sizeof(ack) || ack[0] != 1) {
         fprintf(stderr, "[QUARK-SDK] FATAL: kernel-level protection was not confirmed "
                          "(daemon is reachable, but Ring 0 registration failed -- is "
-                         "quark_kernel.ko loaded?). Refusing to continue unprotected.\n");
+                         "quark_kernel.ko loaded, or refused because this looks like a VM?). "
+                         "Refusing to continue unprotected.\n");
         close(quark_socket_fd);
         quark_socket_fd = -1;
         return -1;
     }
 
-    printf("[QUARK-SDK] Successfully initialized and linked to Quark Daemon (PID: %d)\n", pid);
+    quark_is_testing_build = ack[1] ? 1 : 0;
+    memcpy(quark_kernel_version, &ack[2], sizeof(quark_kernel_version) - 1);
+    quark_kernel_version[sizeof(quark_kernel_version) - 1] = '\0';
+
+    if (quark_is_testing_build) {
+        fprintf(stderr, "[QUARK-SDK] WARNING: kernel module reports this is a TESTING "
+                         "build (VM check bypassed) -- not a substitute for real protection.\n");
+    }
+
+    printf("[QUARK-SDK] Successfully initialized and linked to Quark Daemon (PID: %d, "
+           "kernel version: %s)\n", pid, quark_kernel_version);
 
     if (pthread_create(&quark_watchdog_thread, NULL, quark_watchdog_main, NULL) != 0) {
         perror("[QUARK-SDK] failed to start connection watchdog thread");
@@ -204,6 +225,34 @@ int quark_sdk_is_active(void) {
     int active = (quark_socket_fd != -1);
     pthread_mutex_unlock(&quark_fd_mutex);
     return active;
+}
+
+int quark_sdk_is_testing_build(void) {
+    pthread_mutex_lock(&quark_fd_mutex);
+    int active = (quark_socket_fd != -1);
+    int testing = quark_is_testing_build;
+    pthread_mutex_unlock(&quark_fd_mutex);
+    return active ? testing : 0;
+}
+
+int quark_sdk_get_version(char *buf, size_t buf_size) {
+    if (!buf || buf_size == 0) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&quark_fd_mutex);
+    int active = (quark_socket_fd != -1);
+    if (active) {
+        strncpy(buf, quark_kernel_version, buf_size - 1);
+        buf[buf_size - 1] = '\0';
+    }
+    pthread_mutex_unlock(&quark_fd_mutex);
+
+    if (!active) {
+        buf[0] = '\0';
+        return -1;
+    }
+    return 0;
 }
 
 void quark_sdk_close(void) {

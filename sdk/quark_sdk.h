@@ -2,6 +2,7 @@
 #define QUARK_SDK_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,6 +57,28 @@ int quark_sdk_update_var(void *address, uint64_t new_value);
  * quark_sdk_close() was called).
  */
 int quark_sdk_is_active(void);
+
+/**
+ * Reports whether the kernel module currently protecting this process is a
+ * TESTING build -- i.e. it was compiled with the VM-detection bypass and
+ * would (unlike a release build) accept running inside a hypervisor guest.
+ * A testing build should never be trusted as equivalent to real protection
+ * by anything that matters (e.g. a game server deciding whether to accept a
+ * client into a match that requires anticheat).
+ * Returns 1 if this is a testing build, 0 otherwise (including if Quark
+ * protection isn't active at all).
+ */
+int quark_sdk_is_testing_build(void);
+
+/**
+ * Copies the kernel module's version string (as reported by the daemon
+ * during registration) into buf.
+ * @param buf Destination buffer.
+ * @param buf_size Size of buf; the copied string is always NUL-terminated.
+ * Returns 0 on success, -1 if Quark protection isn't active (buf is left
+ * empty) or buf/buf_size are invalid.
+ */
+int quark_sdk_get_version(char *buf, size_t buf_size);
 
 /**
  * Closes the Quark SDK connection and cleans up resources.

@@ -521,3 +521,59 @@ scenarios above all exercise the host's own local connection through the same
 `BindConnection` code path a remote client would use, which covers the logic, but a real
 cross-process run would need a second VM or a second local Quark-active/inactive engine
 instance side by side, which wasn't set up here.
+
+## 12. VM detection, the testing-build bypass, and version attestation
+
+**Motivation**: the kernel module only ever protected against *other processes* reading
+protected memory. Running the protected process inside a VM is a standard way to defeat
+that (debug from the host, snapshot/rewind memory, or just study the module's behavior
+in a disposable sandbox), so `quark_kernel.c` now refuses to protect anything when it
+detects it's running as a hypervisor guest — via the CPUID "hypervisor present" bit
+(`boot_cpu_has(X86_FEATURE_HYPERVISOR)`, kernel-supported and set by every major
+hypervisor for the guest).
+
+**The catch**: this project's own test rig (`root@192.168.122.203`, see the top of this
+document) is itself a libvirt/KVM guest, so a hard refusal would break every kernel-level
+test that has ever been run here. Fixed with a genuine compile-time split, not a runtime
+flag: `kernel/Makefile`'s `all` target builds a release `.ko` that has no code path
+capable of bypassing the VM check at all; a new `testing` target additionally defines
+`QUARK_TESTING_BUILD`, compiling in the bypass (and a `TESTING BUILD` warning in `dmesg`
+every time it's used). `run_test_kernel.sh` now builds `testing` for that reason;
+`run_test_kernel_release.sh` is new and specifically builds `all` to exercise the refusal
+on this same VM.
+
+A testing build is deliberately weaker, so it can never pass itself off as real
+protection. The kernel's netlink "protect PID" command (previously fire-and-forget) now
+replies with `{ok, is_testing_build, version}`; `quark_cli` prints that as `QUARK_OK:` /
+`QUARK_TESTING_BUILD:` / `QUARK_VERSION:` lines; the daemon scrapes them and forwards an
+18-byte ack (up from 1 byte) to the SDK; `quark_sdk_init()` stores it and exposes
+`quark_sdk_is_testing_build()` / `quark_sdk_get_version()` alongside the existing
+`quark_sdk_is_active()`. Not wired into RecoilEngine's `RequireQuarkAnticheat` gate in
+this pass (see the branch's plan/PR) — a natural follow-up now that both features live on
+`Dev` together.
+
+**Validated live on the VM** (`/home/quark/Quark-Anticheat`, kernel `7.0.9-200.nobara.fc43.x86_64`;
+the persistent `quark.socket`/`quark.service` were stopped for the duration of both runs
+and restarted afterward with the `testing` module reloaded, restoring normal operation):
+
+- **`run_test_kernel.sh` (testing build)** — `dmesg`: `[QUARK-KERNEL] TESTING BUILD:
+  hypervisor detected, VM check bypassed for PID 5339`, immediately followed by
+  `Process 5339 is now protected by Quark`. Game log: `[QUARK-SDK] WARNING: kernel module
+  reports this is a TESTING build (VM check bypassed) -- not a substitute for real
+  protection.` followed by `Successfully initialized ... kernel version: 0.3.0` and
+  `[GAME] Quark kernel version: 0.3.0 (testing build: 1)`. Cheat attack blocked as before
+  (`health` stayed `100`) — full regression pass, behavior unchanged from before this
+  feature.
+- **`run_test_kernel_release.sh` (release build)** — `dmesg`: `[QUARK-KERNEL] Refusing to
+  protect PID 5752: hypervisor detected (this is a release build)`, and no
+  `"... is now protected"` line at all. Game log: `[QUARK-SDK] FATAL: kernel-level
+  protection was not confirmed (... or refused because this looks like a VM?). Refusing
+  to continue unprotected.` — the existing ack/nack fail-closed path, reused without any
+  changes needed. The cheat then succeeded (`health` became `9999`), confirming no
+  protection was silently half-active.
+
+**Not validated in this pass**: the release path succeeding normally on real bare-metal
+hardware (`is_testing_build` reporting `0`, protection registering as usual) — this VM-only
+test rig can only exercise the "in a VM" side of the release build. Same category of gap
+as the two-process cross-network test noted in §11: called out explicitly rather than
+silently skipped.

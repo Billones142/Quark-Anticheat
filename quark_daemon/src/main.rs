@@ -118,13 +118,24 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                     .args(&["./quark_daemon/quark_cli", "1", &pid.to_string()])
                     .output();
                 // quark_cli exits non-zero on any netlink failure (e.g. the kernel
-                // module isn't loaded), so its exit status is the actual source of
-                // truth for whether Ring 0 protection is active for this PID -- not
-                // just whether the daemon itself is reachable.
+                // module isn't loaded, or it refused because it detected a VM), so
+                // its exit status is the actual source of truth for whether Ring 0
+                // protection is active for this PID -- not just whether the daemon
+                // itself is reachable. On success it also prints QUARK_VERSION: and
+                // QUARK_TESTING_BUILD: lines we scrape out of its stdout below.
+                let mut kernel_version = String::from("unknown");
+                let mut kernel_testing_build = false;
                 let kernel_ok = match &output {
                     Ok(out) => {
                         let stdout_str = String::from_utf8_lossy(&out.stdout);
                         print!("[QUARK-DAEMON] Kernel Registration output: {}", stdout_str);
+                        for line in stdout_str.lines() {
+                            if let Some(v) = line.strip_prefix("QUARK_VERSION:") {
+                                kernel_version = v.trim().to_string();
+                            } else if let Some(v) = line.strip_prefix("QUARK_TESTING_BUILD:") {
+                                kernel_testing_build = v.trim() == "1";
+                            }
+                        }
                         if !out.status.success() {
                             let stderr_str = String::from_utf8_lossy(&out.stderr);
                             eprintln!("[QUARK-DAEMON] Kernel Registration stderr: {}", stderr_str);
@@ -144,10 +155,25 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                     );
                 }
 
-                // Tell the client whether Ring 0 protection is actually active, so
-                // quark_sdk_init() can refuse to let the game run unprotected
-                // instead of assuming success just because the daemon answered.
-                if let Err(e) = stream.write_all(&[if kernel_ok { 1u8 } else { 0u8 }]) {
+                if kernel_testing_build {
+                    println!(
+                        "[QUARK-DAEMON] NOTE: kernel module for PID {} is a TESTING build (VM check bypassed).",
+                        pid
+                    );
+                }
+
+                // Tell the client whether Ring 0 protection is actually active (and
+                // what build reported it), so quark_sdk_init() can refuse to let the
+                // game run unprotected instead of assuming success just because the
+                // daemon answered, and so games/servers can later refuse to trust a
+                // testing build even when it reports "active".
+                let mut ack = [0u8; 18];
+                ack[0] = if kernel_ok { 1 } else { 0 };
+                ack[1] = if kernel_testing_build { 1 } else { 0 };
+                let version_bytes = kernel_version.as_bytes();
+                let copy_len = version_bytes.len().min(16);
+                ack[2..2 + copy_len].copy_from_slice(&version_bytes[..copy_len]);
+                if let Err(e) = stream.write_all(&ack) {
                     eprintln!("[QUARK-DAEMON] Failed to send registration ack: {:?}", e);
                     return Err(e);
                 }

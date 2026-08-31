@@ -1,17 +1,21 @@
 #!/bin/bash
 
-# Quark Anticheat - Ring 0 (Kernel) Test Script
-# This script compiles the kernel module, loads it, runs the daemon, 
-# launches the game, and tests that the cheat is blocked at the kernel level.
+# Quark Anticheat - Release Kernel Module VM-Refusal Test Script
+#
+# Companion to run_test_kernel.sh, which builds the TESTING kernel module
+# (VM check bypassed) because this test rig is itself a hypervisor guest.
+# This script instead builds the RELEASE module and asserts the opposite
+# outcome: on a hypervisor guest, the release module must refuse to protect
+# anything at all, and the game must observe that refusal (via the existing
+# ack/nack fail-closed handshake) instead of silently getting real protection.
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 BOLD='\033[1m'
 
-echo -e "${BOLD}=== Quark Anticheat: Starting Ring 0 (Kernel-Level) Test ===${NC}"
+echo -e "${BOLD}=== Quark Anticheat: Release Kernel Module VM-Refusal Test ===${NC}"
 
-# Check if running in a VM/system with sudo capabilities
 if ! command -v sudo &> /dev/null; then
     echo -e "${RED}Error: 'sudo' command not found. Root privileges are required to load kernel modules.${NC}"
     exit 1
@@ -26,11 +30,8 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-echo "Compiling Ring 0 Kernel Module (testing build -- this test rig is itself a VM, so"
-echo "the VM-check bypass has to be compiled in for protection to work here at all;"
-echo "see run_test_kernel_release.sh for the test that the release build correctly"
-echo "refuses in exactly this situation)..."
-make -C kernel testing > /dev/null
+echo "Compiling Ring 0 Kernel Module (RELEASE build -- no VM-check bypass compiled in)..."
+make -C kernel > /dev/null
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error: Kernel module compilation failed! Are kernel headers installed?${NC}"
     exit 1
@@ -39,7 +40,6 @@ echo -e "${GREEN}All components compiled successfully.${NC}\n"
 
 # 2. Load the kernel module
 echo "Loading kernel module 'quark_kernel' (requires sudo)..."
-# Unload first if already loaded
 sudo rmmod quark_kernel 2>/dev/null
 sudo insmod kernel/quark_kernel.ko
 if [ $? -ne 0 ]; then
@@ -48,7 +48,6 @@ if [ $? -ne 0 ]; then
 fi
 echo -e "${GREEN}Kernel module loaded successfully.${NC}\n"
 
-# Clean up logs
 rm -f daemon.log game.log cheat.log
 
 # 3. Start the Quark Daemon in the background
@@ -67,7 +66,6 @@ echo -e "Daemon started (PID: $DAEMON_PID).\n"
 
 # 4. Start the Mock Game in the background
 echo "Starting Mock Game..."
-# Timed subshell to send 'p' at t=2.0s to check state
 (
   sleep 2.0
   echo "p"
@@ -85,7 +83,7 @@ if ! ps -p $GAME_PID > /dev/null; then
 fi
 echo -e "Mock Game started (PID: $GAME_PID).\n"
 
-# 5. Extract 'health' address
+# 5. Extract 'health' address (still printed by print_status() regardless of protection state)
 HEALTH_ADDR=$(grep -oP "Health address:\s+\K0x[0-9a-fA-F]+" game.log)
 if [ -z "$HEALTH_ADDR" ]; then
     echo -e "${RED}Error: Could not extract health address.${NC}"
@@ -96,40 +94,44 @@ if [ -z "$HEALTH_ADDR" ]; then
 fi
 echo -e "Target Variable 'health' found at address: ${BOLD}$HEALTH_ADDR${NC}\n"
 
-# 6. Execute the Cheat program to modify the memory of the game
-echo -e "${BOLD}Simulating Cheat Attack (Kernel module should intercept)...${NC}"
+# 6. Execute the Cheat program -- expected to SUCCEED, since the release module
+# should have refused to register protection for this PID at all.
+echo -e "${BOLD}Simulating Cheat Attack (should succeed: release module must have refused protection in this VM)...${NC}"
 echo "Running: ./cheat/cheat $GAME_PID $HEALTH_ADDR 9999"
 ./cheat/cheat $GAME_PID $HEALTH_ADDR 9999 > cheat.log 2>&1
-CHEAT_EXIT=$?
 
-# Wait for 'p' command print
 sleep 1.5
 
 # 7. Verification
 echo -e "\n${BOLD}=== Verification ===${NC}"
 
-# Check cheat output
 echo -e "${BOLD}[Cheat Log]${NC}"
 cat cheat.log
 echo -e "------------------\n"
 
-# Check if the game is still running (it should be, since the cheat was BLOCKED and memory didn't change)
-if ps -p $GAME_PID > /dev/null; then
-    echo -e "${GREEN}SUCCESS: The Mock Game is still running safely (not terminated because no memory change happened).${NC}"
+echo -e "${BOLD}[Game Log]${NC}"
+cat game.log
+echo -e "------------------\n"
+
+PASS=1
+
+if grep -q "FATAL: kernel-level protection was not confirmed" game.log; then
+    echo -e "${GREEN}CONFIRMED: quark_sdk_init() reported the fail-closed FATAL message.${NC}"
 else
-    echo -e "${RED}FAIL: The Mock Game was terminated!${NC}"
+    echo -e "${RED}FAIL: Expected the SDK's FATAL fail-closed message; game.log doesn't contain it.${NC}"
+    PASS=0
 fi
 
-# Show final game logs to see the health value
-echo -e "\n${BOLD}[Game Log State]${NC}"
-cat game.log
-echo -e "----------------\n"
-
-# Verify if the value was successfully kept at 100
-if grep -q "Value: 100" game.log; then
-    echo -e "${GREEN}${BOLD}CONFIRMED: The health variable remained at 100! The kernel module successfully blocked the write operation.${NC}"
+if grep -q "Value: 9999" game.log; then
+    echo -e "${GREEN}CONFIRMED: The health variable WAS modified to 9999 -- no kernel-level protection was active, as expected in a release build running inside a VM.${NC}"
 else
-    echo -e "${RED}FAIL: The health variable was modified! Check game.log.${NC}"
+    echo -e "${RED}FAIL: health was not modified -- either protection unexpectedly succeeded, or the cheat itself failed.${NC}"
+    PASS=0
+fi
+
+if ! ps -p $GAME_PID > /dev/null; then
+    echo -e "${RED}FAIL: The Mock Game was terminated (no monitoring session should have started at all).${NC}"
+    PASS=0
 fi
 
 # 8. Unload kernel module and show dmesg output
@@ -142,5 +144,10 @@ echo -e "\n${BOLD}=== Kernel Ring Buffer Logs (dmesg) ===${NC}"
 sudo dmesg | tail -n 12
 echo -e "---------------------------------------\n"
 
-echo -e "${GREEN}${BOLD}Ring 0 Test completed successfully!${NC}"
-exit 0
+if [ "$PASS" -eq 1 ]; then
+    echo -e "${GREEN}${BOLD}Release-build VM-refusal test completed successfully!${NC}"
+    exit 0
+else
+    echo -e "${RED}${BOLD}Release-build VM-refusal test FAILED -- see above.${NC}"
+    exit 1
+fi
