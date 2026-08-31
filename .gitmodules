@@ -1,0 +1,4 @@
+[submodule "RecoilEngine"]
+	path = RecoilEngine
+	url = https://github.com/Billones142/RecoilEngine.git
+	branch = quark-anticheat-integration

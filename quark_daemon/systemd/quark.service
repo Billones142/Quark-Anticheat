@@ -1,0 +1,18 @@
+[Unit]
+Description=Quark Anticheat Daemon
+Requires=quark.socket
+After=quark.socket
+
+[Service]
+Type=simple
+# Adjust these two paths to wherever this repo is actually checked out.
+ExecStart=/opt/quark-anticheat/quark_daemon/target/release/quark_daemon
+WorkingDirectory=/opt/quark-anticheat
+# Needs root: manages the Ring-0 kernel module over Netlink (via quark_cli)
+# and, in the userspace-fallback path, reads other processes' /proc/<pid>/mem.
+User=root
+
+# Socket-activated: systemd starts this only when something first connects to
+# quark.socket (same mechanism Docker uses for docker.socket -> dockerd), and
+# keeps it running afterward -- it does not stop again just because the
+# connection that triggered it closed.

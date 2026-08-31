@@ -1,0 +1,13 @@
+[Unit]
+Description=Quark Anticheat Daemon Socket
+
+[Socket]
+ListenStream=/tmp/quark.sock
+# rw for all: the daemon runs as root (see quark.service), but game
+# processes connecting to it run as a regular user and need to reach this
+# socket. Matches the SDK's hardcoded path in sdk/quark_sdk.c.
+SocketMode=0666
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

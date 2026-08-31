@@ -1,12 +1,43 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+// First file descriptor systemd hands to a socket-activated service, per the
+// sd_listen_fds(3) protocol (fds 0/1/2 are stdio, activation fds start at 3).
+const SD_LISTEN_FDS_START: i32 = 3;
+
+/// Picks up the listening socket from systemd if this process was launched via
+/// socket activation (LISTEN_FDS/LISTEN_PID set by systemd, matching how
+/// `docker.socket` starts `dockerd` on demand): the socket already exists and
+/// is already bound before we even start, so the daemon only runs while
+/// something is actually talking to it. Returns None if not socket-activated,
+/// so `main` can fall back to binding the socket itself (e.g. for manual
+/// testing without systemd).
+fn systemd_activated_listener() -> Option<UnixListener> {
+    let listen_pid = std::env::var("LISTEN_PID").ok()?;
+    if listen_pid.parse::<u32>().ok()? != std::process::id() {
+        // Not meant for us (e.g. inherited by a child process by mistake).
+        return None;
+    }
+
+    let listen_fds: i32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
+    if listen_fds < 1 {
+        return None;
+    }
+
+    // SAFETY: systemd guarantees fd SD_LISTEN_FDS_START is a valid, already
+    // connect()-able AF_UNIX SOCK_STREAM socket when it sets LISTEN_FDS/
+    // LISTEN_PID this way (see systemd.socket(5) / sd_listen_fds(3)); we only
+    // reach here after checking LISTEN_PID matches our own pid.
+    Some(unsafe { UnixListener::from_raw_fd(SD_LISTEN_FDS_START) })
+}
 
 // Command IDs
 const CMD_REGISTER_GAME: u32 = 1;
@@ -86,27 +117,54 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                 let output = Command::new("sudo")
                     .args(&["./quark_daemon/quark_cli", "1", &pid.to_string()])
                     .output();
-                match output {
+                // quark_cli exits non-zero on any netlink failure (e.g. the kernel
+                // module isn't loaded), so its exit status is the actual source of
+                // truth for whether Ring 0 protection is active for this PID -- not
+                // just whether the daemon itself is reachable.
+                let kernel_ok = match &output {
                     Ok(out) => {
                         let stdout_str = String::from_utf8_lossy(&out.stdout);
-                        let stderr_str = String::from_utf8_lossy(&out.stderr);
                         print!("[QUARK-DAEMON] Kernel Registration output: {}", stdout_str);
                         if !out.status.success() {
+                            let stderr_str = String::from_utf8_lossy(&out.stderr);
                             eprintln!("[QUARK-DAEMON] Kernel Registration stderr: {}", stderr_str);
                         }
+                        out.status.success()
                     }
                     Err(e) => {
                         eprintln!("[QUARK-DAEMON] Failed to execute quark_cli: {:?}", e);
+                        false
                     }
+                };
+
+                if !kernel_ok {
+                    eprintln!(
+                        "[QUARK-DAEMON] Refusing to confirm protection for PID {}: kernel module registration failed.",
+                        pid
+                    );
                 }
-                
+
+                // Tell the client whether Ring 0 protection is actually active, so
+                // quark_sdk_init() can refuse to let the game run unprotected
+                // instead of assuming success just because the daemon answered.
+                if let Err(e) = stream.write_all(&[if kernel_ok { 1u8 } else { 0u8 }]) {
+                    eprintln!("[QUARK-DAEMON] Failed to send registration ack: {:?}", e);
+                    return Err(e);
+                }
+
+                if !kernel_ok {
+                    // Nothing left to supervise for this connection: the client's
+                    // watchdog will see the socket close and refuse to continue.
+                    break;
+                }
+
                 let mut lock = state.lock().unwrap();
                 *lock = Some(QuarkState {
                     pid,
                     variables: HashMap::new(),
                     is_active: true,
                 });
-                
+
                 // Spawn the monitoring thread (runs in user-space as redundancy / logging)
                 let state_for_thread = Arc::clone(&state);
                 thread::spawn(move || {
@@ -282,22 +340,34 @@ fn run_monitor_loop(state: Arc<Mutex<Option<QuarkState>>>) -> std::io::Result<()
 
 fn main() {
     let socket_path = "/tmp/quark.sock";
-    
-    if Path::new(socket_path).exists() {
-        let _ = std::fs::remove_file(socket_path);
-    }
-    
-    let listener = match UnixListener::bind(socket_path) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("Failed to bind socket: {:?}", e);
-            std::process::exit(1);
+
+    let (listener, activated) = match systemd_activated_listener() {
+        Some(l) => (l, true),
+        None => {
+            // Not socket-activated (no systemd, or launched directly for
+            // testing) -- fall back to binding the socket ourselves, same as
+            // before.
+            if Path::new(socket_path).exists() {
+                let _ = std::fs::remove_file(socket_path);
+            }
+
+            match UnixListener::bind(socket_path) {
+                Ok(l) => (l, false),
+                Err(e) => {
+                    eprintln!("Failed to bind socket: {:?}", e);
+                    std::process::exit(1);
+                }
+            }
         }
     };
-    
+
     println!("==================================================");
     println!("🛡️🛡️  QUARK ANTICHEAT DAEMON ACTIVE  🛡️🛡️");
-    println!("Listening on Unix socket: {}", socket_path);
+    if activated {
+        println!("Listening on Unix socket: {} (systemd socket activation)", socket_path);
+    } else {
+        println!("Listening on Unix socket: {}", socket_path);
+    }
     println!("==================================================");
     
     for stream in listener.incoming() {
