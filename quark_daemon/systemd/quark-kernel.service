@@ -1,0 +1,26 @@
+[Unit]
+Description=Load the Quark Anticheat Ring-0 kernel module
+# Ordering-only, not a hard dependency: quark.service/quark.socket work fine
+# (fail closed, via the ack/nack handshake in quark_sdk_init()) even if this
+# hasn't run yet or fails -- they just refuse to confirm protection instead
+# of silently pretending to be protected. This unit exists so a reboot
+# doesn't leave the module unloaded indefinitely until someone notices.
+Before=quark.socket
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Adjust to wherever this repo is actually checked out, and to whichever .ko
+# was built for this box:
+#   kernel/quark_kernel.ko          (release -- `make -C kernel`, refuses to
+#                                     protect anything running inside a VM)
+#   a `make -C kernel testing` build (bypasses that check -- only appropriate
+#                                     on a hypervisor-guest test rig, like
+#                                     this project's own VM; see
+#                                     docs/vm_test_environment.md #12)
+Environment=QUARK_KERNEL_MODULE=/opt/quark-anticheat/kernel/quark_kernel.ko
+ExecStart=/bin/sh -c 'lsmod | grep -q "^quark_kernel " || /usr/sbin/insmod "$QUARK_KERNEL_MODULE"'
+ExecStop=/usr/sbin/rmmod quark_kernel
+
+[Install]
+WantedBy=multi-user.target

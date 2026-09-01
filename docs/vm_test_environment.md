@@ -131,10 +131,30 @@ connects — confirmed by launching the patched engine and watching it flip to
 `active (running)`). Daemon logs now go to the journal
 (`journalctl -u quark.service`) instead of a manually-redirected file.
 
-The kernel module still needs the manual `insmod` step above — systemd starting the
+The kernel module still needed the manual `insmod` step above — systemd starting the
 daemon doesn't imply the kernel module is loaded, and the daemon has no way to load it
 itself (that would need root capabilities it doesn't currently request, and is out of
-scope here).
+scope here). This bit twice: once as the original "Cheat Engine reads memory with no
+errors" bug (§11) and again after a VM reboot during the vm-detection work (§12) —
+`quark.socket`/`quark.service` are real, enabled systemd units and came back on their
+own, but the module has never had one, so it just silently stayed unloaded until noticed.
+
+Closed with a third unit, `quark_daemon/systemd/quark-kernel.service` — a `Type=oneshot`,
+`RemainAfterExit=yes` service that `insmod`s the module (idempotent: skips if already
+loaded, so `systemctl restart` is safe too) and `rmmod`s it on stop, ordered `Before=
+quark.socket` (best-effort ordering only — nothing actually depends on it, since the
+ack/nack handshake already makes "module not loaded" fail closed rather than fail open).
+Installed the same way as the other two units:
+```bash
+cp quark_daemon/systemd/quark-kernel.service /etc/systemd/system/
+# edit Environment=QUARK_KERNEL_MODULE= to point at the right .ko for this box
+systemctl daemon-reload
+systemctl enable --now quark-kernel.service
+```
+On this VM specifically, `QUARK_KERNEL_MODULE` points at `/home/quark/Quark-Anticheat/
+kernel/quark_kernel.ko` built via `make -C kernel testing` (this rig is a hypervisor
+guest, see §12) — a release build (`make -C kernel`) would just refuse to load protection
+here at all.
 
 ## 4. Problems hit on the VM and how they were resolved
 
