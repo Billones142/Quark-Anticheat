@@ -17,6 +17,7 @@
 #include <linux/skbuff.h>
 #include <linux/string.h>
 #include <linux/uidgid.h>
+#include <linux/cred.h>
 #include <linux/fs.h>
 #include <linux/fcntl.h>
 #include <linux/slab.h>
@@ -251,6 +252,13 @@ static pid_t protected_pids[MAX_PROTECTED_PROCESSES];
 static int protected_pids_count = 0;
 static DEFINE_SPINLOCK(quark_lock);
 
+// The one pid (tgid) exempted from the protected-process access block below, set via
+// the authenticated command 3 (quark_daemon registers its own pid once at startup so
+// its monitor thread can read the memory of processes it registers as protected).
+// -1 (no real pid) until registered. Deliberately a single slot, not a list: there is
+// only ever one legitimate daemon.
+static pid_t trusted_monitor_pid = -1;
+
 // Helper to check if a PID is currently protected
 static bool is_pid_protected(pid_t pid) {
     int i;
@@ -312,8 +320,9 @@ static bool quark_protect_pid(pid_t pid) {
     return true;
 }
 
-// Sends a quark_protect_response back to the requesting quark_cli over the
-// same Netlink socket.
+// Sends a quark_protect_response back to the requesting quark_cli over the same
+// Netlink socket. Reused for command 3 (register trusted monitor) too -- both are
+// simple ok/nack requests, no need for a second response struct.
 static void quark_send_protect_response(u32 dest_pid, bool ok) {
     struct sk_buff *skb_out;
     struct nlmsghdr *nlh;
@@ -382,7 +391,8 @@ static int ptrace_may_access_entry_handler(struct kretprobe_instance *ri, struct
 /*
  * Return handler: runs after ptrace_may_access finishes.
  * We inspect if the target task is protected. If so, and the caller is not
- * the process itself, we override the return value (rax) to 0 (false/access denied).
+ * the process itself or the one authenticated trusted monitor, we override
+ * the return value (rax) to 0 (false/access denied).
  */
 static int ptrace_may_access_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct task_struct *task = *((struct task_struct **)ri->data);
@@ -393,15 +403,33 @@ static int ptrace_may_access_ret_handler(struct kretprobe_instance *ri, struct p
         return 0;
     }
 
-    target_pid = task_pid_vnr(task);
-    parent_pid = task_pid_vnr(current);
+    // task_tgid_vnr(), not task_pid_vnr(): the latter is per-*thread* (each thread
+    // has its own distinct kernel pid_t, only a process's leader thread's happens to
+    // equal its getpid()/tgid), so it silently broke self-access for any protected
+    // process that reads its own memory from a non-leader thread, and would equally
+    // have broken a same-process trusted-monitor comparison below (quark_daemon's
+    // monitor runs on a background std::thread, a different tid from its own
+    // process-wide getpid()). Comparing tgids matches what quark_sdk_init()'s
+    // getpid() and quark_daemon's own pid actually mean.
+    target_pid = task_tgid_vnr(task);
+    parent_pid = task_tgid_vnr(current);
 
     if (is_pid_protected(target_pid)) {
-        // Allow the process to access itself, block others
-        if (target_pid != parent_pid) {
-            pr_warn("[QUARK-KERNEL ALERT] Blocked memory/ptrace access to protected process %d by PID %d!\n", 
+        // Allow the process to access itself, and allow the one specific pid
+        // authenticated as the trusted monitor (command 3, quark_register_monitor())
+        // -- quark_daemon's own run_monitor_loop() (quark_daemon/src/main.rs) reads
+        // /proc/<pid>/mem to cross-check registered variables, and needs this exact
+        // exemption or it's blocked identically to an attacker the instant a PID
+        // becomes protected. Deliberately NOT "any root process": this project's own
+        // test scripts run quark_daemon *and* the attack-simulating `cheat` tool both
+        // as root (ssh session convenience), and a blanket root exemption was tried
+        // first here and found, live, to let `cheat` through right along with the
+        // daemon -- a real regression, not just a test artifact, since a cheat
+        // process elevated to root by any means would have sailed through too.
+        if (target_pid != parent_pid && parent_pid != trusted_monitor_pid) {
+            pr_warn("[QUARK-KERNEL ALERT] Blocked memory/ptrace access to protected process %d by PID %d!\n",
                     target_pid, parent_pid);
-            
+
 #ifdef CONFIG_X86_64
             // Override rax register (return value) to 0 (false)
             regs->ax = 0;
@@ -421,12 +449,12 @@ static struct kretprobe quark_kretprobe = {
 /*
  * Netlink receiver callback. Receives commands from userspace daemon.
  *
- * Commands 1 (protect) and 2 (unprotect) both change real protection state for a PID,
- * so both go through the same authentication gate: sender must be root running the
- * real quark_cli binary (quark_check_sender), and must present a fresh
- * (quark_nonce_is_fresh), validly-signed (quark_verify_signature) request. Without
- * this, any local process could open its own netlink socket to this protocol and
- * strip protection from an arbitrary PID.
+ * Commands 1 (protect), 2 (unprotect), and 3 (register trusted monitor) all change
+ * real protection state, so all three go through the same authentication gate:
+ * sender must be root running the real quark_cli binary (quark_check_sender), and
+ * must present a fresh (quark_nonce_is_fresh), validly-signed (quark_verify_signature)
+ * request. Command 3 especially: an unauthenticated version of it would let any local
+ * process grant itself read access to every protected process's memory outright.
  */
 static void quark_nl_recv_msg(struct sk_buff *skb) {
     struct nlmsghdr *nlh;
@@ -437,21 +465,25 @@ static void quark_nl_recv_msg(struct sk_buff *skb) {
     nlh = (struct nlmsghdr *)skb->data;
     msg_type = nlh->nlmsg_type;
 
-    if (msg_type != 1 && msg_type != 2) {
+    if (msg_type != 1 && msg_type != 2 && msg_type != 3) {
         pr_warn("[QUARK-KERNEL] Unknown Netlink message type: %d\n", msg_type);
         return;
     }
+    // Commands 1 and 3 are request/response (the caller needs to know whether it
+    // actually took effect, not just that the netlink send succeeded); 2 stays
+    // fire-and-forget.
+#define QUARK_EXPECTS_RESPONSE(t) ((t) == 1 || (t) == 3)
 
     if (nlmsg_len(nlh) < sizeof(req)) {
         pr_err("[QUARK-KERNEL] Netlink payload too small for command %d\n", msg_type);
-        if (msg_type == 1)
+        if (QUARK_EXPECTS_RESPONSE(msg_type))
             quark_send_protect_response(nlh->nlmsg_pid, false);
         return;
     }
     memcpy(&req, nlmsg_data(nlh), sizeof(req));
 
     if (!quark_check_sender(skb)) {
-        if (msg_type == 1)
+        if (QUARK_EXPECTS_RESPONSE(msg_type))
             quark_send_protect_response(nlh->nlmsg_pid, false);
         return;
     }
@@ -459,7 +491,7 @@ static void quark_nl_recv_msg(struct sk_buff *skb) {
     if (!quark_nonce_is_fresh(req.nonce)) {
         pr_err("[QUARK-KERNEL] Rejecting command %d for pid %d: stale/replayed nonce\n",
                msg_type, req.pid);
-        if (msg_type == 1)
+        if (QUARK_EXPECTS_RESPONSE(msg_type))
             quark_send_protect_response(nlh->nlmsg_pid, false);
         return;
     }
@@ -471,7 +503,7 @@ static void quark_nl_recv_msg(struct sk_buff *skb) {
     if (!quark_verify_signature(signed_buf, sizeof(signed_buf), req.sig, req.sig_len)) {
         pr_err("[QUARK-KERNEL] Rejecting command %d for pid %d: signature verification failed\n",
                msg_type, req.pid);
-        if (msg_type == 1)
+        if (QUARK_EXPECTS_RESPONSE(msg_type))
             quark_send_protect_response(nlh->nlmsg_pid, false);
         return;
     }
@@ -487,8 +519,14 @@ static void quark_nl_recv_msg(struct sk_buff *skb) {
         case 2: // Command: Unprotect PID
             remove_protected_pid(req.pid);
             break;
+        case 3: // Command: Register trusted monitor pid
+            trusted_monitor_pid = req.pid;
+            pr_info("[QUARK-KERNEL] Trusted monitor pid set to %d\n", req.pid);
+            quark_send_protect_response(nlh->nlmsg_pid, true);
+            break;
     }
 }
+#undef QUARK_EXPECTS_RESPONSE
 
 static int __init quark_kernel_init(void) {
     struct netlink_kernel_cfg cfg = {

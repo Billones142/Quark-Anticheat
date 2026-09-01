@@ -692,3 +692,70 @@ plain root-only PEM file, no HSM/rotation/distribution story — explicitly out 
 per the "testing" framing of this whole keypair) and a genuine multi-machine replay
 capture (the replay test used a same-VM, same-key reproduction of a captured message
 rather than an actual network-level interception).
+
+## 14. The daemon's own monitor thread was silently unable to read protected memory
+
+Spotted from a live journalctl paste while running a real BAR session: `quark_daemon`'s
+`run_monitor_loop()` (a supplementary, redundant tamper check that directly polls a
+registered process's `/proc/<pid>/mem` and compares it against the last value reported
+via `quark_sdk_update_var()` — separate from, and secondary to, the real Ring-0
+protection) was failing with `Permission denied` the instant a process it just
+registered became protected:
+```
+[QUARK-MONITOR] Warning: Could not open /proc/2468/mem: Os { code: 13, kind: PermissionDenied, ... }
+[QUARK-MONITOR] Thread terminated with error: ...
+```
+Not what it looked like at first (the game itself blocked from its own memory, or a
+missing SDK allow-list entry) -- `ptrace_may_access_ret_handler`
+(`kernel/quark_kernel.c`) blocks everyone except the protected process itself, full
+stop, with no notion that quark_daemon's *own* legitimate monitor thread reading its
+own client is different from an attacker. It's very likely never worked since this
+feature was written -- this warning almost certainly appears in this project's very
+first commits too, just never looked closely at because it doesn't affect the real
+(kretprobe-level) protection at all, only this secondary, supplementary check.
+
+**First attempt, and why it was wrong**: exempting any *root* caller from the block.
+Compiled, loaded, and looked right in isolation -- but running the full
+`run_test_kernel.sh` immediately showed a false-positive `TAMPERING DETECTED`, and
+`ps`/journal digging showed why: this project's own test scripts run **both**
+`quark_daemon` **and** the attack-simulating `cheat` tool as root (the ssh session they
+run under), so a blanket root exemption let `cheat`'s forged write through right along
+with the daemon's legitimate read -- not a test artifact, a real regression, since any
+cheat process that gained root by any means would sail through identically in
+production too.
+
+**Actual fix**: a single authenticated "trusted monitor" pid, not a blanket root
+exemption. New netlink command 3 (`kernel/quark_kernel.c`'s `quark_nl_recv_msg`, reusing
+the exact same signature + nonce + root + exe-hash authentication gate already built for
+commands 1/2 -- unauthenticated, command 3 would let any local process grant itself read
+access to every protected process outright) sets `static pid_t trusted_monitor_pid`;
+`ptrace_may_access_ret_handler` exempts only `parent_pid == trusted_monitor_pid`, in
+addition to self-access. `quark_daemon` sends this once at startup with its own pid
+(`main()`, before entering the accept loop) via `quark_cli 3 <own pid>` -- best-effort,
+non-fatal if the kernel module isn't loaded yet.
+
+**Bonus fix found in the same handler**: both `target_pid` and `parent_pid` were
+computed via `task_pid_vnr()`, which is *per-thread* (each thread has its own distinct
+kernel pid_t; only a process's leader thread's happens to equal its `getpid()`/tgid) --
+harmless for a single-threaded mock game, but would have silently broken (a) self-access
+for any multi-threaded protected process reading its own memory from a non-leader
+thread, likely including the real, definitely-multi-threaded RecoilEngine, and (b) the
+trusted-monitor comparison above, since `quark_daemon`'s monitor runs on a spawned
+`std::thread` with its own distinct tid, different from the process-wide pid it
+registers via `std::process::id()`. Switched both to `task_tgid_vnr()`, matching what
+`getpid()` actually means on both the signer and kernel side.
+
+**Also improved** (the original ask that led here): `quark_daemon`'s two
+`/proc/<pid>/mem`-reading error paths (`run_monitor_loop()`'s open, and
+`CMD_REGISTER_VAR`'s initial-value read) now log a detailed, specific explanation on
+`PermissionDenied` instead of a bare `Os { code: 13, ... }` -- pointing at exactly this
+mechanism, so a future occurrence (e.g. `quark-kernel.service`'s `Environment=
+QUARK_KERNEL_MODULE=` pointing at a build that predates command 3) is immediately
+diagnosable instead of requiring this same investigation again.
+
+**Validated live on the VM**: `run_test_kernel.sh` regression-clean with the real fix
+(`dmesg`: `Trusted monitor pid set to <daemon pid>`; daemon log shows the monitor thread
+starting with no `Permission denied` and no `TAMPERING DETECTED`), cheat attack still
+correctly blocked (`dmesg`: `Blocked memory/ptrace access to protected process <game
+pid> by PID <cheat pid>`, itself a *different* root process from the daemon) --
+confirming the fix is precise, not a re-opened hole.

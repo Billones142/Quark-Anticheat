@@ -297,13 +297,32 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                                     println!("[QUARK-DAEMON] Read initial value for '{}': {}", name, val);
                                     val
                                 } else {
+                                    eprintln!(
+                                        "[QUARK-DAEMON] Warning: opened {} but failed to read {} bytes at 0x{:X} for '{}' -- falling back to expected_value=0.",
+                                        mem_path, size, address, name
+                                    );
                                     0
                                 }
                             } else {
+                                eprintln!(
+                                    "[QUARK-DAEMON] Warning: opened {} but failed to seek to 0x{:X} for '{}' -- falling back to expected_value=0.",
+                                    mem_path, address, name
+                                );
                                 0
                             }
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            // Same root cause as run_monitor_loop()'s EACCES case below if
+                            // this is PermissionDenied: this daemon process itself couldn't
+                            // read a PID it just registered as protected. Non-fatal here --
+                            // expected_value just starts at 0 instead of the real value,
+                            // which self-corrects on the game's next quark_sdk_update_var()
+                            // call -- but worth logging since it silently masked a real bug
+                            // (the kernel blocking even root, fixed in quark_kernel.c) before.
+                            eprintln!(
+                                "[QUARK-DAEMON] Warning: could not open {} to read '{}''s initial value ({:?}) -- falling back to expected_value=0.",
+                                mem_path, name, e
+                            );
                             0
                         }
                     };
@@ -376,7 +395,24 @@ fn run_monitor_loop(state: Arc<Mutex<Option<QuarkState>>>) -> std::io::Result<()
     let mut mem_file = match File::open(&mem_path) {
         Ok(f) => f,
         Err(e) => {
-            println!("[QUARK-MONITOR] Warning: Could not open {}: {:?}", mem_path, e);
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!(
+                    "[QUARK-MONITOR] Warning: Could not open {} (Permission denied). This is \
+                     the daemon's own supplementary variable-tamper check failing to read a \
+                     process it just registered as protected -- not the game being denied \
+                     access to its own memory (that's the Ring-0 kretprobe working as \
+                     intended, unrelated to this). Expected cause: this daemon isn't running \
+                     as root (quark.service should set User=root; see kernel/quark_kernel.c's \
+                     ptrace_may_access_ret_handler, which exempts root callers from the \
+                     protected-PID block specifically so this thread can read a client it \
+                     registered -- everyone else, root included previously, was blocked \
+                     identically to an attacker). This thread exits; core Ring-0 protection \
+                     for PID {} is unaffected either way.",
+                    mem_path, pid
+                );
+            } else {
+                println!("[QUARK-MONITOR] Warning: Could not open {}: {:?}", mem_path, e);
+            }
             return Err(e);
         }
     };
@@ -458,7 +494,38 @@ fn main() {
         println!("Listening on Unix socket: {}", socket_path);
     }
     println!("==================================================");
-    
+
+    // Registers this process's own pid as the kernel module's trusted monitor (see
+    // kernel/quark_kernel.c's ptrace_may_access_ret_handler / trusted_monitor_pid) --
+    // without it, run_monitor_loop()'s /proc/<pid>/mem reads get blocked by the same
+    // kretprobe as an attacker's would, the instant a pid becomes protected, since
+    // the kernel has no other way to recognize this specific process as trusted.
+    // Best-effort and non-fatal: if the kernel module isn't loaded yet (or this fails
+    // for any other reason), the daemon keeps running -- CMD_REGISTER_GAME's own
+    // ack/nack already makes "kernel not actually protecting anything" fail closed
+    // for clients regardless; this only affects the supplementary monitor thread.
+    let own_pid = std::process::id();
+    match Command::new("sudo")
+        .args(&["./quark_daemon/quark_cli", "3", &own_pid.to_string()])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            println!("[QUARK-DAEMON] Registered pid {} as trusted monitor with the kernel module.", own_pid);
+        }
+        Ok(out) => {
+            eprintln!(
+                "[QUARK-DAEMON] Warning: failed to register as trusted monitor (kernel module not \
+                 loaded yet?). The supplementary variable-tamper monitor thread will not be able \
+                 to read protected processes' memory until this succeeds -- core Ring-0 protection \
+                 is unaffected. quark_cli stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Err(e) => {
+            eprintln!("[QUARK-DAEMON] Warning: failed to run quark_cli to register as trusted monitor: {:?}", e);
+        }
+    }
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {

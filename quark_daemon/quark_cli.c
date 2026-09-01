@@ -99,15 +99,15 @@ static int quark_sign_request(uint8_t command, int32_t pid, uint64_t nonce,
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <1=protect/2=unprotect> <pid>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <1=protect/2=unprotect/3=register-trusted-monitor> <pid>\n", argv[0]);
         return 1;
     }
-    
+
     int command = atoi(argv[1]);
     int target_pid = atoi(argv[2]);
-    
-    if (command != 1 && command != 2) {
-        fprintf(stderr, "Invalid command. Use 1 for protect, 2 for unprotect.\n");
+
+    if (command != 1 && command != 2 && command != 3) {
+        fprintf(stderr, "Invalid command. Use 1 for protect, 2 for unprotect, 3 to register a trusted monitor pid.\n");
         return 1;
     }
     
@@ -128,7 +128,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (command == 1) {
+    if (command == 1 || command == 3) {
         struct timeval tv;
         tv.tv_sec = QUARK_CLI_RECV_TIMEOUT_SEC;
         tv.tv_usec = 0;
@@ -184,15 +184,15 @@ int main(int argc, char *argv[]) {
     printf("[QUARK-CLI] Command sent successfully.\n");
     free(nlh);
 
-    if (command != 1) {
+    if (command != 1 && command != 3) {
         // Unprotect stays fire-and-forget: nothing waits on it.
         close(sock_fd);
         return 0;
     }
 
-    // Protect: wait for the kernel's ok/testing-build/version reply. Printed
-    // as parseable "KEY:VALUE" lines so quark_daemon can scrape them out of
-    // our already-captured stdout without a separate IPC channel.
+    // Protect and register-trusted-monitor: wait for the kernel's ok/testing-build/
+    // version reply. Printed as parseable "KEY:VALUE" lines so quark_daemon can
+    // scrape them out of our already-captured stdout without a separate IPC channel.
     uint8_t resp_buf[NLMSG_SPACE(sizeof(struct quark_protect_response))];
     ssize_t n = recv(sock_fd, resp_buf, sizeof(resp_buf), 0);
     close(sock_fd);
