@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# std's UnixStream::peer_cred() is still gated behind the unstable
+# peer_credentials_unix_socket feature (rust-lang/rust#42839) even on this toolchain,
+# so SO_PEERCRED is read directly via libc instead -- see get_peer_pid() in main.rs.
+libc = "0.2"

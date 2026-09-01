@@ -31,7 +31,8 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "Compiling Ring 0 Kernel Module (RELEASE build -- no VM-check bypass compiled in)..."
-make -C kernel > /dev/null
+# Top-level target, not `make -C kernel` directly -- see run_test_kernel.sh's comment.
+make kernel > /dev/null
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error: Kernel module compilation failed! Are kernel headers installed?${NC}"
     exit 1

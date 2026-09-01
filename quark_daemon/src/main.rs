@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::Command;
@@ -80,12 +80,54 @@ fn bytes_to_u64(buf: &[u8], size: u32) -> u64 {
     }
 }
 
+// SO_PEERCRED is kernel-verified: it reports the real pid/uid/gid of whoever is on
+// the other end of this specific connected socket, unlike anything a client could
+// put in its own payload. std's UnixStream::peer_cred() would be the natural way to
+// get this, but it's still gated behind the unstable peer_credentials_unix_socket
+// feature on this toolchain, so it's read directly via libc instead.
+fn get_peer_pid(stream: &UnixStream) -> Option<i32> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+
+    let ret = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+
+    if ret == 0 && len == std::mem::size_of::<libc::ucred>() as libc::socklen_t {
+        Some(cred.pid)
+    } else {
+        None
+    }
+}
+
 fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
     println!("[QUARK-DAEMON] Client connected.");
-    
+
+    // /tmp/quark.sock is world read/write (game processes need to reach it), so the
+    // pid a client *claims* in CMD_REGISTER_GAME's payload can't be trusted -- a
+    // malicious local process could claim someone else's real, already-protected pid
+    // and then just disconnect, tricking this function's own cleanup path into
+    // unprotecting the victim. peer_cred() is kernel-verified (SO_PEERCRED under the
+    // hood) and can't be spoofed by the client, so it -- not the payload -- is the
+    // only pid ever actually used against the kernel module below.
+    let real_pid: Option<i32> = get_peer_pid(&stream);
+    if real_pid.is_none() {
+        eprintln!("[QUARK-DAEMON] Could not determine the real pid of the connecting client (peer_cred failed); refusing to register it.");
+    }
+
     let state: Arc<Mutex<Option<QuarkState>>> = Arc::new(Mutex::new(None));
     let state_clone = Arc::clone(&state);
-    
+
     let mut header_buf = [0u8; 8];
     
     loop {
@@ -109,9 +151,30 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                     println!("[QUARK-DAEMON] Invalid payload size for REGISTER_GAME");
                     continue;
                 }
-                let pid = i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let claimed_pid = i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
+
+                // Authority comes from peer_cred() alone -- see the comment where
+                // real_pid is computed above. The payload's pid is only ever used for
+                // an anomaly log line.
+                let pid = match real_pid {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[QUARK-DAEMON] Refusing REGISTER_GAME: no verified peer pid for this connection.");
+                        if let Err(e) = stream.write_all(&[0u8; 18]) {
+                            eprintln!("[QUARK-DAEMON] Failed to send registration nack: {:?}", e);
+                            return Err(e);
+                        }
+                        break;
+                    }
+                };
+                if claimed_pid != pid {
+                    eprintln!(
+                        "[QUARK-DAEMON] NOTE: client on pid {} claimed pid {} in its REGISTER_GAME payload -- ignoring the claim, using the real connection pid.",
+                        pid, claimed_pid
+                    );
+                }
                 println!("[QUARK-DAEMON] Registering game process with PID: {}", pid);
-                
+
                 // 1. Tell kernel module to PROTECT this PID
                 println!("[QUARK-DAEMON] Registering PID {} to Ring 0 Module...", pid);
                 let output = Command::new("sudo")

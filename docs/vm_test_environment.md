@@ -141,10 +141,17 @@ own, but the module has never had one, so it just silently stayed unloaded until
 
 Closed with a third unit, `quark_daemon/systemd/quark-kernel.service` — a `Type=oneshot`,
 `RemainAfterExit=yes` service that `insmod`s the module (idempotent: skips if already
-loaded, so `systemctl restart` is safe too) and `rmmod`s it on stop, ordered `Before=
-quark.socket` (best-effort ordering only — nothing actually depends on it, since the
-ack/nack handshake already makes "module not loaded" fail closed rather than fail open).
-Installed the same way as the other two units:
+loaded, so `systemctl restart` is safe too) and `rmmod`s it on stop. No explicit ordering
+against `quark.socket`: a first version tried `Before=quark.socket`, which turned out to
+create a genuine systemd ordering cycle (`quark.socket` is pulled in via
+`sockets.target`, ahead of `basic.target`; this unit's default dependencies put it after
+`basic.target` — systemd detected the cycle at boot and silently dropped the ordering, so
+it was doing nothing anyway) — caught when the VM rebooted mid-session and
+`journalctl -u quark-kernel.service` showed `Found ordering cycle`. Removed rather than
+fixed with `DefaultDependencies=no`, since nothing actually depends on strict ordering in
+the first place: the ack/nack handshake already makes "module not loaded" fail closed
+rather than fail open, whichever unit starts first. Installed the same way as the other
+two units:
 ```bash
 cp quark_daemon/systemd/quark-kernel.service /etc/systemd/system/
 # edit Environment=QUARK_KERNEL_MODULE= to point at the right .ko for this box
@@ -597,3 +604,91 @@ hardware (`is_testing_build` reporting `0`, protection registering as usual) —
 test rig can only exercise the "in a VM" side of the release build. Same category of gap
 as the two-process cross-network test noted in §11: called out explicitly rather than
 silently skipped.
+
+## 13. Authenticating the kernel module's control channel (netlink + Unix socket)
+
+**Two real local-privilege-escalation-adjacent holes found while designing this**, both
+letting an unprivileged local process strip Ring-0 protection from an arbitrary victim
+process with no special access:
+
+1. `NETLINK_QUARK` (protocol 31) had no sender authentication at all. Any local process
+   could `socket(AF_NETLINK, SOCK_RAW, 31)` and send an "unprotect PID" command for
+   someone else's real, protected PID — completely defeating the anticheat.
+2. `quark_daemon`'s Unix socket (`/tmp/quark.sock`, `SocketMode=0666`) trusted whatever
+   `pid` a connecting client put in its own `CMD_REGISTER_GAME` payload
+   (`quark_daemon/src/main.rs`). A malicious process could connect, claim a victim's real
+   pid, then disconnect — the daemon's own cleanup path would then legitimately (with its
+   real root privilege, and after this fix, a real signature) unprotect the victim.
+
+Fixing only #1 would have been security theater: #2 achieves the identical outcome with
+less effort and no netlink code at all. Both are fixed together.
+
+**Fix, four layers** (`kernel/quark_kernel.c`'s `quark_nl_recv_msg`/`quark_check_sender`/
+`quark_verify_signature`, `quark_daemon/quark_cli.c`, `quark_daemon/src/main.rs`):
+
+1. **Real peer pid for the Unix socket** — `handle_client` now reads the connecting
+   process's real pid via `SO_PEERCRED` (`getsockopt`, wrapped in `get_peer_pid()`; std's
+   `UnixStream::peer_cred()` is still unstable on this toolchain — see the `libc`
+   dependency added to `quark_daemon/Cargo.toml`) and uses *only* that value against the
+   kernel module. The payload's claimed pid is logged as an anomaly, never trusted.
+2. **Root-only senders** — `NETLINK_CREDS(skb)` (kernel-verified sender credentials, not
+   the self-reported, unenforced `nlmsg_pid` header field) must show uid 0.
+3. **Sender exe-identity check** — the sender's `/proc/<pid>/exe` is hashed (SHA-256) and
+   compared against `quark_cli_expected_sha256`, embedded via a new build step
+   (`kernel/quark_cli_hash.h`, regenerated from whichever `quark_cli` was just compiled —
+   see the top-level `Makefile`'s new `kernel`/`kernel-testing` targets). Two "obvious" ways
+   to do this (`find_task_by_vpid`, `get_task_exe_file`, then `get_task_mm`+
+   `get_mm_exe_file`) turned out **not exported** for out-of-tree modules on this kernel —
+   confirmed by two separate failed builds (`modpost: ... undefined!`). Settled on
+   `filp_open("/proc/<pid>/exe", ...)`, one of the most universally-exported VFS
+   primitives, sidestepping `task_struct`/`mm_struct` internals entirely.
+4. **ECDSA P-256 signature + nonce** — `quark_cli` signs `{command, pid, nonce}` (nonce =
+   current time in nanoseconds) with a testing keypair
+   (`tooling/keys/generate-testing-key.sh`, private key never committed, installed at
+   `/opt/quark-anticheat/keys/quark_signing_key.pem`, 0600). The kernel verifies via the
+   kernel crypto API's generic `crypto_sig` interface — confirmed empirically (a small
+   throwaway probe module, not part of this repo) that this kernel wants
+   `crypto_alloc_sig("x962(ecdsa-nist-p256)", ...)` specifically (the bare
+   `"ecdsa-nist-p256"` name rejects both the key and a DER signature), a raw 65-byte SEC1
+   uncompressed public key point, and a standard DER signature — exactly what OpenSSL's
+   EVP API produces with no custom encoding. A `static u64 last_nonce`, advanced only
+   after full verification succeeds, rejects any nonce that isn't strictly greater than
+   the last accepted one.
+
+None of these four layers alone is sufficient (root can already do a lot on its own; an
+exe-hash check alone doesn't stop invoking the real `quark_cli` with attacker-chosen
+arguments; a signature without the Unix-socket fix doesn't matter if the daemon can be
+tricked into legitimately signing an unprotect for the wrong pid) — the point is that
+*all four together* mean only the real daemon, talking to the real `quark_cli` binary,
+running as root, with a fresh signed request, can ever change protection state.
+
+**Validated live on the VM**, using a throwaway attack-simulation tool and a modified
+`quark_cli` (temporary, testing-only nonce-override argument, reverted before committing)
+to build a genuine same-nonce replay — neither lives in this repo:
+
+- **Regression**: `run_test_kernel.sh` and `run_test_kernel_release.sh` both still pass
+  unmodified — the new checks are transparent to the legitimate daemon → `quark_cli` flow.
+- **Non-root forgery**: a well-formed unprotect request for a live protected pid, sent
+  from a non-root user's own netlink socket — `dmesg`: `Rejecting netlink command from
+  non-root uid 1001`. Target stayed protected (`cheat` got `Permission denied`).
+- **Wrong-binary forgery, even with a cryptographically valid signature**: signed the
+  exact same request with the real private key, from a throwaway binary (not `quark_cli`)
+  running as root — `dmesg`: `Rejecting netlink command: sender pid ...'s exe does not
+  match the expected quark_cli`. Proves the exe-identity check does real work, not just
+  "is root".
+- **Replay**: the real `quark_cli`, real key, sent the identical `{pid, nonce, signature}`
+  twice. First send succeeded (`Process ... removed from Quark protection`); the second,
+  byte-identical send was rejected: `Rejecting command 2 for pid ...: stale/replayed
+  nonce`.
+- **Unix-socket pid-spoofing**: connected directly to `/tmp/quark.sock`, sent
+  `CMD_REGISTER_GAME` claiming an unrelated fake victim pid (`999999`). Daemon log:
+  `NOTE: client on pid 8016 claimed pid 999999 ... ignoring the claim, using the real
+  connection pid`, followed by `Registering game process with PID: 8016` and, on
+  disconnect, `Unregistering PID 8016` — the real connecting pid throughout, the claimed
+  one never touched.
+
+**Not validated in this pass**: production-grade key management (the testing key is a
+plain root-only PEM file, no HSM/rotation/distribution story — explicitly out of scope,
+per the "testing" framing of this whole keypair) and a genuine multi-machine replay
+capture (the replay test used a same-VM, same-key reproduction of a captured message
+rather than an actual network-level interception).

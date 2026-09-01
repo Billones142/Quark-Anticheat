@@ -16,20 +16,45 @@
 #include <linux/netlink.h>
 #include <linux/skbuff.h>
 #include <linux/string.h>
+#include <linux/uidgid.h>
+#include <linux/fs.h>
+#include <linux/fcntl.h>
+#include <linux/slab.h>
+#include <crypto/hash.h>
+#include <crypto/sig.h>
 #include <net/sock.h>
 #ifdef CONFIG_X86_64
 #include <asm/cpufeature.h>
 #endif
 
+// Auto-generated, see tooling/keys/generate-testing-key.sh (quark_pubkey.h, public,
+// committed) and the top-level Makefile (quark_cli_hash.h, regenerated every build
+// from the actually-compiled quark_cli binary, not committed).
+#include "quark_pubkey.h"
+#include "quark_cli_hash.h"
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Martinez Alarcon, Gabriel Sebastian & Merino De Rui, Stefano Nahuel");
 MODULE_DESCRIPTION("Quark Anticheat - Ring 0 Security Module (kretprobes & Netlink)");
-MODULE_VERSION("0.3.0");
+MODULE_VERSION("0.4.0");
 
-#define QUARK_KERNEL_VERSION "0.3.0"
+#define QUARK_KERNEL_VERSION "0.4.0"
 
 #define NETLINK_QUARK 31  // Custom netlink protocol number
 #define MAX_PROTECTED_PROCESSES 16
+#define QUARK_MAX_SIG_LEN 72     // max DER-encoded ECDSA P-256 signature size
+#define QUARK_MAX_EXE_SIZE (1 << 20)  // 1MB cap on the exe file we'll hash
+
+// Wire format for commands 1 (protect) and 2 (unprotect): authenticated and
+// replay-protected, since either one changes real protection state for a PID.
+// The signature covers {command, pid, nonce} -- see quark_verify_signature() and
+// quark_nl_recv_msg()'s signed_buf construction.
+struct quark_netlink_request {
+    s32 pid;
+    u64 nonce;                     // must be strictly greater than the last accepted one
+    u16 sig_len;                   // actual DER signature length, <= QUARK_MAX_SIG_LEN
+    u8  sig[QUARK_MAX_SIG_LEN];
+};
 
 // Reply to a "protect PID" request, sent back to the requesting quark_cli over
 // the same Netlink socket. Lets userspace (and, through the daemon/SDK chain,
@@ -53,6 +78,172 @@ static bool quark_running_in_vm(void) {
 #else
     return false;
 #endif
+}
+
+static u64 last_nonce = 0;
+static DEFINE_SPINLOCK(quark_nonce_lock);
+
+// Computes SHA-256 of `data` (`len` bytes) into `digest` (32 bytes).
+static int quark_sha256(const void *data, size_t len, u8 digest[32]) {
+    struct crypto_shash *tfm;
+    struct shash_desc *desc;
+    int ret;
+
+    tfm = crypto_alloc_shash("sha256", 0, 0);
+    if (IS_ERR(tfm))
+        return PTR_ERR(tfm);
+
+    desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL);
+    if (!desc) {
+        crypto_free_shash(tfm);
+        return -ENOMEM;
+    }
+    desc->tfm = tfm;
+
+    ret = crypto_shash_digest(desc, data, len, digest);
+
+    kfree(desc);
+    crypto_free_shash(tfm);
+    return ret;
+}
+
+// Verifies an ECDSA P-256 signature (`sig`, DER-encoded, `sig_len` bytes) over the
+// SHA-256 digest of `signed_data` (`signed_len` bytes), against the embedded
+// quark_pubkey (kernel/quark_pubkey.h). Returns true only on a fully valid signature.
+//
+// Algorithm name/key/signature format confirmed empirically against this project's
+// actual kernel (crypto_alloc_sig("x962(ecdsa-nist-p256)", ...) wants the raw 65-byte
+// SEC1 uncompressed public key point, and a standard DER-encoded ECDSA signature --
+// exactly what OpenSSL's EVP API produces, no custom encoding needed on the signer
+// side). The bare "ecdsa-nist-p256" name (no x962 wrapper) rejects both of those.
+static bool quark_verify_signature(const void *signed_data, size_t signed_len,
+                                    const u8 *sig, u16 sig_len) {
+    struct crypto_sig *tfm;
+    u8 digest[32];
+    int ret;
+
+    if (sig_len == 0 || sig_len > QUARK_MAX_SIG_LEN)
+        return false;
+
+    if (quark_sha256(signed_data, signed_len, digest) != 0)
+        return false;
+
+    tfm = crypto_alloc_sig("x962(ecdsa-nist-p256)", 0, 0);
+    if (IS_ERR(tfm))
+        return false;
+
+    if (crypto_sig_set_pubkey(tfm, quark_pubkey, sizeof(quark_pubkey)) != 0) {
+        crypto_free_sig(tfm);
+        return false;
+    }
+
+    ret = crypto_sig_verify(tfm, sig, sig_len, digest, sizeof(digest));
+    crypto_free_sig(tfm);
+
+    return ret == 0;
+}
+
+// Rejects any nonce that isn't strictly greater than the last one that passed full
+// authentication -- defeats replay of a captured, validly-signed request. Resets on
+// module reload, same as protected_pids (a reload is already a trust-boundary reset).
+static bool quark_nonce_is_fresh(u64 nonce) {
+    bool fresh;
+    unsigned long flags;
+
+    spin_lock_irqsave(&quark_nonce_lock, flags);
+    fresh = nonce > last_nonce;
+    spin_unlock_irqrestore(&quark_nonce_lock, flags);
+    return fresh;
+}
+
+// Only ever called after a request has fully passed signature verification --
+// otherwise an attacker could burn nonces with garbage signatures.
+static void quark_nonce_advance(u64 nonce) {
+    unsigned long flags;
+
+    spin_lock_irqsave(&quark_nonce_lock, flags);
+    if (nonce > last_nonce)
+        last_nonce = nonce;
+    spin_unlock_irqrestore(&quark_nonce_lock, flags);
+}
+
+// Reads up to QUARK_MAX_EXE_SIZE bytes of `file` and SHA-256s them into `digest`.
+static int quark_hash_file(struct file *file, u8 digest[32]) {
+    loff_t size = i_size_read(file_inode(file));
+    loff_t pos = 0;
+    void *buf;
+    ssize_t n;
+    int ret;
+
+    if (size <= 0 || size > QUARK_MAX_EXE_SIZE)
+        return -EFBIG;
+
+    buf = kvmalloc(size, GFP_KERNEL);
+    if (!buf)
+        return -ENOMEM;
+
+    n = kernel_read(file, buf, size, &pos);
+    if (n != size) {
+        kvfree(buf);
+        return (n < 0) ? (int)n : -EIO;
+    }
+
+    ret = quark_sha256(buf, size, digest);
+    kvfree(buf);
+    return ret;
+}
+
+// Defense-in-depth alongside the signature check: confirms the process that actually
+// sent this netlink message -- per the kernel-verified sender credentials in
+// NETLINK_CREDS(skb), NOT the self-reported nlmsg_pid header field, which has no
+// kernel-enforced binding to the real sender and isn't usable for identity -- is (a)
+// running as root, since quark_cli only ever runs via `sudo`, and (b) really is the
+// compiled quark_cli binary, by content hash, not just some other root process.
+//
+// Neither check alone is sufficient (root can already do plenty on its own; a hash
+// check alone doesn't stop someone invoking the real quark_cli with attacker-chosen
+// arguments): quark_verify_signature() above is what actually proves *authority* to
+// change protection state. This is additional friction on top of that, not a
+// replacement for it.
+static bool quark_check_sender(const struct sk_buff *skb) {
+    struct scm_creds *creds = NETLINK_CREDS(skb);
+    char path[32];
+    struct file *exe_file;
+    u8 digest[32];
+    bool ok = false;
+
+    if (!uid_eq(creds->uid, GLOBAL_ROOT_UID)) {
+        pr_err("[QUARK-KERNEL] Rejecting netlink command from non-root uid %u (pid %u)\n",
+               __kuid_val(creds->uid), creds->pid);
+        return false;
+    }
+
+    // Several more "obvious" ways to get a task's exe file from a pid
+    // (find_task_by_vpid, get_task_exe_file, get_mm_exe_file -- all confirmed via
+    // failed builds: modpost reports them undefined) aren't actually exported for
+    // out-of-tree modules on this kernel. filp_open() on /proc/<pid>/exe is: it's one
+    // of the most fundamental, universally-exported VFS primitives, and /proc/<pid>/exe
+    // is already a magic symlink the kernel resolves straight to the same file
+    // task->mm->exe_file points at -- no task_struct/mm_struct walking needed.
+    snprintf(path, sizeof(path), "/proc/%u/exe", creds->pid);
+    exe_file = filp_open(path, O_RDONLY, 0);
+
+    if (IS_ERR(exe_file)) {
+        pr_err("[QUARK-KERNEL] Rejecting netlink command: could not open exe of pid %u (%ld)\n",
+               creds->pid, PTR_ERR(exe_file));
+        return false;
+    }
+
+    if (quark_hash_file(exe_file, digest) == 0 &&
+        memcmp(digest, quark_cli_expected_sha256, sizeof(digest)) == 0) {
+        ok = true;
+    } else {
+        pr_err("[QUARK-KERNEL] Rejecting netlink command: sender pid %u's exe does not "
+               "match the expected quark_cli\n", creds->pid);
+    }
+
+    fput(exe_file);
+    return ok;
 }
 
 static struct sock *nl_socket = NULL;
@@ -229,33 +420,72 @@ static struct kretprobe quark_kretprobe = {
 
 /*
  * Netlink receiver callback. Receives commands from userspace daemon.
+ *
+ * Commands 1 (protect) and 2 (unprotect) both change real protection state for a PID,
+ * so both go through the same authentication gate: sender must be root running the
+ * real quark_cli binary (quark_check_sender), and must present a fresh
+ * (quark_nonce_is_fresh), validly-signed (quark_verify_signature) request. Without
+ * this, any local process could open its own netlink socket to this protocol and
+ * strip protection from an arbitrary PID.
  */
 static void quark_nl_recv_msg(struct sk_buff *skb) {
     struct nlmsghdr *nlh;
-    int pid;
+    struct quark_netlink_request req;
     int msg_type;
+    u8 signed_buf[1 + sizeof(req.pid) + sizeof(req.nonce)];
 
     nlh = (struct nlmsghdr *)skb->data;
     msg_type = nlh->nlmsg_type;
-    
-    if (nlmsg_len(nlh) < sizeof(int)) {
-        pr_err("[QUARK-KERNEL] Netlink payload too small\n");
+
+    if (msg_type != 1 && msg_type != 2) {
+        pr_warn("[QUARK-KERNEL] Unknown Netlink message type: %d\n", msg_type);
         return;
     }
-    
-    pid = *(int *)nlmsg_data(nlh);
+
+    if (nlmsg_len(nlh) < sizeof(req)) {
+        pr_err("[QUARK-KERNEL] Netlink payload too small for command %d\n", msg_type);
+        if (msg_type == 1)
+            quark_send_protect_response(nlh->nlmsg_pid, false);
+        return;
+    }
+    memcpy(&req, nlmsg_data(nlh), sizeof(req));
+
+    if (!quark_check_sender(skb)) {
+        if (msg_type == 1)
+            quark_send_protect_response(nlh->nlmsg_pid, false);
+        return;
+    }
+
+    if (!quark_nonce_is_fresh(req.nonce)) {
+        pr_err("[QUARK-KERNEL] Rejecting command %d for pid %d: stale/replayed nonce\n",
+               msg_type, req.pid);
+        if (msg_type == 1)
+            quark_send_protect_response(nlh->nlmsg_pid, false);
+        return;
+    }
+
+    signed_buf[0] = (u8)msg_type;
+    memcpy(&signed_buf[1], &req.pid, sizeof(req.pid));
+    memcpy(&signed_buf[1 + sizeof(req.pid)], &req.nonce, sizeof(req.nonce));
+
+    if (!quark_verify_signature(signed_buf, sizeof(signed_buf), req.sig, req.sig_len)) {
+        pr_err("[QUARK-KERNEL] Rejecting command %d for pid %d: signature verification failed\n",
+               msg_type, req.pid);
+        if (msg_type == 1)
+            quark_send_protect_response(nlh->nlmsg_pid, false);
+        return;
+    }
+
+    quark_nonce_advance(req.nonce);
 
     switch (msg_type) {
         case 1: { // Command: Protect PID
-            bool ok = quark_protect_pid(pid);
+            bool ok = quark_protect_pid(req.pid);
             quark_send_protect_response(nlh->nlmsg_pid, ok);
             break;
         }
         case 2: // Command: Unprotect PID
-            remove_protected_pid(pid);
-            break;
-        default:
-            pr_warn("[QUARK-KERNEL] Unknown Netlink message type: %d\n", msg_type);
+            remove_protected_pid(req.pid);
             break;
     }
 }
