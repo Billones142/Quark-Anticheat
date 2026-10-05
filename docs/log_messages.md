@@ -31,7 +31,7 @@ respectively).
 | `[QUARK-KERNEL] Process %d is now protected by Quark.` | info | A PID was added to the protected list (daemon sent Netlink command `1`, usually right after a game calls `quark_sdk_init()`). |
 | `[QUARK-KERNEL] Process %d removed from Quark protection.` | info | A PID was removed (Netlink command `2` — daemon sends this when the game's socket connection closes). |
 | `[QUARK-KERNEL] Protected PID table full, cannot protect PID %d` | warn | The 16-slot protected-PID table (`MAX_PROTECTED_PROCESSES`) is full; this PID was **not** protected. Needs an `[QUARK-KERNEL] Process ... removed` first, or a kernel-side capacity change. |
-| `[QUARK-KERNEL ALERT] Blocked memory/ptrace access to protected process %d by PID %d!` | warn | **The actual detection event** — some other process just tried `ptrace()`/opened `/proc/<pid>/mem` on a protected process and was denied. This is the line to grep for (`dmesg \| grep QUARK-KERNEL`) to see real interception activity. |
+| `[QUARK-KERNEL ALERT] Blocked memory access to protected process %d by PID %d (ptrace mode 0x%x)!` | warn | **The actual detection event** — some other process just tried an attach-level access (`ptrace()`, `/proc/<pid>/mem`, `process_vm_*`) on a protected process and was denied. `mode` is the kernel's `PTRACE_MODE_*` bitmask (has the `0x2` attach bit set). Read-only metadata access (`ps`/`htop` reading `/proc/<pid>/{cmdline,maps}`) is allowed and **not** logged. Ratelimited (`pr_warn_ratelimited`), so a polling attacker can't flood the log — the daemon's `PTRACE_ATTEMPT` telemetry is the per-attempt record. Grep for it with `dmesg \| grep QUARK-KERNEL`. |
 | `[QUARK-KERNEL] Netlink payload too small` | error | A malformed Netlink message arrived (payload smaller than one `int`) — ignored. |
 | `[QUARK-KERNEL] Unknown Netlink message type: %d` | warn | A Netlink message arrived with a command code that isn't `1` (protect) or `2` (unprotect) — ignored. |
 | `[QUARK-KERNEL] Exiting Quark Anticheat Kernel Module...` | info | `rmmod` in progress — kretprobe and Netlink socket are being torn down. |
@@ -67,10 +67,34 @@ marked stderr below. Under systemd both land in the journal regardless.
 | `Error handling client: <err>` *(stderr)* | An I/O error in `handle_client` outside the specific cases above (e.g. a read failed for a reason other than clean EOF). |
 | `Connection failed: <err>` *(stderr)* | `listener.incoming()` itself returned an error accepting a new connection — rare. |
 
+## Daemon BPF-LSM / telemetry (`quark_daemon/src/bpf.rs`, `src/bpf/quark.bpf.c`)
+
+Same output stream as the daemon messages above. `<who>` is always `pid <tgid> (<comm>)`
+of the process that triggered the event.
+
+| Message | Meaning |
+|---|---|
+| `[QUARK-BPF] BPF-LSM hooks and telemetry attached (<n> programs, <n> maps, <n> links).` | Startup: every BPF program loaded and attached. The enforcement in `docs/features.md` §1.5 is active. |
+| `[QUARK-BPF] Warning: could not load/attach BPF-LSM hooks (<err>). Is `bpf` listed in /sys/kernel/security/lsm? ...` *(stderr)* | Startup failed. The daemon keeps running with kretprobe-only protection. The usual cause is `bpf` missing from the `lsm=` boot parameter. A verifier rejection also lands here, and the libbpf error names the program. |
+| `[QUARK-BPF] Warning: failed to mirror PID <pid> into BPF-LSM hooks: <err>` *(stderr)* | The kernel module protected `<pid>`, but the BPF mirror update failed. Kretprobe protection is still active for that pid; the BPF program-load gate and telemetry aren't. |
+| `[QUARK-BPF] Warning: failed to remove pid <pid> from quark_protected: <err>` *(stderr)* | Unprotect couldn't delete the mirror entry. The exit tracepoint deletes it anyway when the process exits. |
+| `[QUARK-BPF] Telemetry poll failed, stopping event thread: <err>` *(stderr)* | The ring buffer reader died. The LSM hooks stay attached and keep enforcing, but no more `[QUARK-BPF]` event lines will appear. |
+| `[QUARK-BPF] Dropped malformed event (<n> bytes)` *(stderr)* | A ring buffer record was shorter than `struct quark_event`. This means `quark_events.h` and `bpf.rs` are out of sync. |
+| `[QUARK-BPF] PTRACE_ATTEMPT: <who> -> protected pid <pid> (mode 0x<m>)` | Something asked for ptrace-level access to a protected process (ptrace attach, `/proc/<pid>/mem`, `process_vm_*`). `mode` is the kernel's `PTRACE_MODE_*` bitmask (always has the `0x2` attach bit here). Only attach-level attempts are reported; read-only metadata access is ignored. The kretprobe does the blocking — check `dmesg` for its `Blocked memory access` line. |
+| `[QUARK-BPF] PROCESS_VM_ACCESS: <who> -> protected pid <pid>` | A `process_vm_readv`/`writev` call targeted a protected pid. A `PTRACE_ATTEMPT` line normally follows and the call fails with `EPERM`. |
+| `[QUARK-BPF] EXEC_MPROTECT: protected <who> made anonymous memory executable (prot 0x<p>)` | The protected process itself mprotect()ed anonymous memory to executable. JITs do this legitimately, and so does injected code. |
+| `[QUARK-BPF] TASK_KILL: <who> sent signal <n> to protected pid <pid>` | A process other than the target sent it a signal. The daemon's own tamper kill (§1.3) shows up here as `kill`, because it's a separate process. |
+| `[QUARK-BPF] MODULE_LOAD: '<name>' loaded by <who> while a process is protected` | A kernel module loaded during a protected session. |
+| `[QUARK-BPF] EXEC: <who>` | A process exec'd during a protected session. Noisy by design, and only emitted while something is protected. |
+| `[QUARK-BPF] BPF_PROG_DENIED: blocked <who> from loading a <type> BPF program` | **Enforcement**: a tracing-class BPF program load was refused while a game is protected. |
+| `[QUARK-BPF] BPF_OBJ_DENIED: blocked <who> from accessing Quark BPF object id <id>` | **Enforcement**: someone other than the daemon tried to get a fd to one of Quark's own maps, programs, or links. |
+| `[QUARK-BPF] DAEMON_ACCESS_DENIED: blocked <who> from ptrace-level access to the daemon (mode 0x<m>)` | **Enforcement**: another process tried to ptrace the daemon, open `/proc/<daemon>/mem`, or use `pidfd_getfd()`/`process_vm_*` on it. Not logged for `PTRACE_MODE_NOAUDIT` checks (`ps`/`pgrep` scanning `/proc`). |
+
 ## SDK (`sdk/quark_sdk.c`) — printed by the game process, not the daemon
 
 | Message | Meaning |
 |---|---|
+| `[QUARK-SDK] WARNING: BPF-LSM hooks are not active for this process (no gate on BPF tracing programs, no telemetry) -- kretprobe protection only.` *(stderr)* | The daemon's ack had `bpf_lsm_active=0`: either the daemon couldn't load its BPF programs (look for its `[QUARK-BPF] Warning` at startup) or mirroring this pid failed. The game is still protected by the kretprobe; `quark_sdk_is_bpf_lsm_active()` returns `0`. |
 | `[QUARK-SDK] Successfully initialized and linked to Quark Daemon (PID: <pid>)` | `quark_sdk_init()` succeeded — connected, registered, and (as of the disconnect-watchdog addition) the background watchdog thread was started. This is the line to look for in the *game's* log to confirm it's protected. |
 | `[QUARK-SDK] socket creation failed: <err>` *(via `perror`)* | `socket(AF_UNIX, ...)` itself failed — very rare (fd exhaustion, etc). `quark_sdk_init()` returns `-1`; game proceeds unprotected (fail-open by design). |
 | `[QUARK-SDK] connection to daemon failed: <err>` *(via `perror`)* | Couldn't `connect()` to `/tmp/quark.sock` — most commonly **the daemon isn't running** ("No such file or directory") or, if it is running, **a socket-permission problem** ("Permission denied" — see the `chmod`/`SocketMode` discussion in `docs/vm_test_environment.md` §3.2). Game proceeds unprotected either way. |

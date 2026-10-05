@@ -26,9 +26,11 @@ static pthread_t quark_watchdog_thread;
 // they're only meaningful together (both reset when the connection drops).
 static int quark_is_testing_build = 0;
 static char quark_kernel_version[17] = "";
+static int quark_bpf_lsm_active = 0;
 
-// Wire layout of the daemon's CMD_REGISTER_GAME reply: [ok:1][is_testing_build:1][version:16].
-#define QUARK_REGISTER_ACK_SIZE 18
+// Wire layout of the daemon's CMD_REGISTER_GAME reply, mirrored by REGISTER_ACK_SIZE in
+// quark_daemon/src/main.rs: [ok:1][is_testing_build:1][version:16][bpf_lsm_active:1].
+#define QUARK_REGISTER_ACK_SIZE 19
 
 static int send_packet(uint32_t command, const void *payload, uint32_t payload_len) {
     if (quark_socket_fd == -1) {
@@ -134,7 +136,7 @@ int quark_sdk_init(void) {
         return -1;
     }
 
-    // The daemon replies with [ok][is_testing_build][version:16] once it knows
+    // The daemon replies with [ok][is_testing_build][version:16][bpf_lsm_active] once it knows
     // whether Ring 0 (kernel module) protection was actually confirmed for our
     // PID -- a live daemon connection alone doesn't mean the kernel module is
     // loaded (see quark_daemon's CMD_REGISTER_GAME handler). Refuse to report
@@ -155,10 +157,17 @@ int quark_sdk_init(void) {
     quark_is_testing_build = ack[1] ? 1 : 0;
     memcpy(quark_kernel_version, &ack[2], sizeof(quark_kernel_version) - 1);
     quark_kernel_version[sizeof(quark_kernel_version) - 1] = '\0';
+    quark_bpf_lsm_active = ack[18] ? 1 : 0;
 
     if (quark_is_testing_build) {
         fprintf(stderr, "[QUARK-SDK] WARNING: kernel module reports this is a TESTING "
                          "build (VM check bypassed) -- not a substitute for real protection.\n");
+    }
+
+    if (!quark_bpf_lsm_active) {
+        fprintf(stderr, "[QUARK-SDK] WARNING: BPF-LSM hooks are not active for this process "
+                         "(no gate on BPF tracing programs, no telemetry) -- kretprobe "
+                         "protection only.\n");
     }
 
     printf("[QUARK-SDK] Successfully initialized and linked to Quark Daemon (PID: %d, "
@@ -233,6 +242,14 @@ int quark_sdk_is_testing_build(void) {
     int testing = quark_is_testing_build;
     pthread_mutex_unlock(&quark_fd_mutex);
     return active ? testing : 0;
+}
+
+int quark_sdk_is_bpf_lsm_active(void) {
+    pthread_mutex_lock(&quark_fd_mutex);
+    int active = (quark_socket_fd != -1);
+    int bpf = quark_bpf_lsm_active;
+    pthread_mutex_unlock(&quark_fd_mutex);
+    return active ? bpf : 0;
 }
 
 int quark_sdk_get_version(char *buf, size_t buf_size) {

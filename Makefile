@@ -6,14 +6,26 @@ SDK_DIR = sdk
 GAME_DIR = game_target
 CHEAT_DIR = cheat
 DAEMON_DIR = quark_daemon
+BPF_VMLINUX = $(DAEMON_DIR)/src/bpf/vmlinux.h
 
-.PHONY: all daemon game cheat kernel kernel-testing clean
+.PHONY: all daemon vmlinux game cheat kernel kernel-testing clean
 
 all: daemon game cheat
 
-daemon: $(DAEMON_DIR)/quark_cli
+daemon: $(DAEMON_DIR)/quark_cli $(BPF_VMLINUX)
 	@echo "=== Compiling Quark Daemon (Rust) ==="
 	cargo build --release --manifest-path $(DAEMON_DIR)/Cargo.toml
+
+# Kernel type definitions for the daemon's BPF-LSM/telemetry programs
+# (quark_daemon/src/bpf/quark.bpf.c), dumped from the build host's BTF. CO-RE
+# relocations let the resulting object load on other kernels too, so this only
+# needs regenerating if the BPF code starts using types this kernel lacks.
+# Not committed (.gitignore): ~160k lines and host-specific.
+vmlinux: $(BPF_VMLINUX)
+
+$(BPF_VMLINUX):
+	@echo "=== Generating vmlinux.h from /sys/kernel/btf/vmlinux ==="
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@
 
 # quark_cli signs every protect/unprotect request with the testing private key
 # (tooling/keys/generate-testing-key.sh) -- needs OpenSSL's libcrypto.
@@ -57,5 +69,6 @@ clean:
 	rm -f $(GAME_DIR)/game
 	rm -f $(CHEAT_DIR)/cheat
 	rm -f kernel/quark_cli_hash.h
+	rm -f $(BPF_VMLINUX)
 	rm -f /tmp/quark.sock
 	make -C kernel clean

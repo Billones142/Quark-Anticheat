@@ -8,3 +8,11 @@ edition = "2024"
 # peer_credentials_unix_socket feature (rust-lang/rust#42839) even on this toolchain,
 # so SO_PEERCRED is read directly via libc instead -- see get_peer_pid() in main.rs.
 libc = "0.2"
+# BPF-LSM hooks + telemetry (src/bpf/quark.bpf.c, loaded by src/bpf.rs). Default
+# features build a vendored static libbpf, so the daemon doesn't depend on the
+# target box's libbpf version matching the build host's.
+libbpf-rs = "0.27"
+
+[build-dependencies]
+# Compiles src/bpf/quark.bpf.c and generates the Rust skeleton ($OUT_DIR/quark.skel.rs).
+libbpf-cargo = "0.27"

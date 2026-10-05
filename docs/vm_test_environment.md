@@ -759,3 +759,128 @@ starting with no `Permission denied` and no `TAMPERING DETECTED`), cheat attack 
 correctly blocked (`dmesg`: `Blocked memory/ptrace access to protected process <game
 pid> by PID <cheat pid>`, itself a *different* root process from the daemon) --
 confirming the fix is precise, not a re-opened hole.
+
+## 15. BPF-LSM hooks and eBPF telemetry — setup and test procedure
+
+**Status: run on the VM on 2026-09-30. Everything passes**, with one kernel limit
+on read-level `/proc` entries (results in §15.4). Code: `quark_daemon/src/bpf/quark.bpf.c` and
+`src/bpf.rs`; see `docs/features.md` §1.5–1.6.
+
+### 15.1 Prerequisites
+
+- `bpf` must be in the kernel's active LSM list:
+
+  ```sh
+  cat /sys/kernel/security/lsm     # must contain "bpf"
+  ```
+
+  If it's missing, append it to the existing list (keep the current order and entries)
+  and reboot. This needs root because it changes the boot configuration:
+
+  ```sh
+  sudo grubby --update-kernel=ALL --args="lsm=$(cat /sys/kernel/security/lsm),bpf"
+  ```
+- Build tools: `clang`, `bpftool` (to generate `vmlinux.h`), and a C toolchain for the
+  vendored libbpf. `make daemon` generates `quark_daemon/src/bpf/vmlinux.h` from the
+  build host's BTF. A host-built binary also runs on the VM because of CO-RE.
+
+### 15.2 Verifier acceptance
+
+```sh
+sudo -E cargo test --manifest-path quark_daemon/Cargo.toml -- --ignored
+```
+
+Loads and attaches all 12 programs on the running kernel, then protects and unprotects a
+dummy pid.
+
+### 15.3 End-to-end checks (testing `.ko` + daemon + protected game)
+
+| # | Action | Expected |
+|---|---|---|
+| 1 | Daemon startup | `[QUARK-BPF] BPF-LSM hooks and telemetry attached (12 programs, ...)` |
+| 2 | `cheat <game pid>` | Still blocked (`dmesg`: kretprobe `Blocked ...`) and a `PTRACE_ATTEMPT` line appears |
+| 3 | `process_vm_readv` against the game (small C probe) | `EPERM`, plus `PROCESS_VM_ACCESS` and `PTRACE_ATTEMPT` |
+| 4 | `sudo bpftrace -e 'uprobe:<game binary>:main {}'` while the game runs | Fails to load; `BPF_PROG_DENIED` (kprobe) |
+| 5 | Same command after the game exits | Loads normally |
+| 6 | `sudo bpftool map dump name quark_protected` | `Operation not permitted`; `BPF_OBJ_DENIED` |
+| 7 | `sudo bpftool link detach id <quark link id>` (ids from `bpftool link list`) | Refused; `BPF_OBJ_DENIED` |
+| 8 | `sudo gdb -p <daemon pid>` / `sudo cat /proc/<daemon pid>/environ` | Permission denied |
+| 9 | `sudo insmod` of any module while the game runs | `MODULE_LOAD` line |
+| 10 | Kill the game | Daemon unprotect log; the exit tracepoint also clears the mirror |
+| 11 | Stop the daemon | Links detach; `bpftrace` and similar tools work again |
+
+Also re-run the tracepoint field check once as root, since the BPF code assumes these
+standard layouts:
+`sudo cat /sys/kernel/tracing/events/{module/module_load,syscalls/sys_enter_process_vm_readv}/format`
+(`module_load` should have a `__data_loc char[] name` field, and `process_vm_readv` should
+have `pid` as its first argument).
+
+### 15.4 Results (2026-09-30)
+
+Setup: the branch was copied to `/root/quark-bpf-test` and built there. Nobara has no
+`bpftool` package, so `vmlinux.h` came from the host, and `clang`, `bpftrace` and `gdb`
+were installed with `dnf`. `quark.socket`/`quark.service` were stopped and this branch's
+testing `.ko` was swapped in for the run, then everything was restored. The map,
+program and link checks used a small C program making raw `bpf()` calls
+(`BPF_*_GET_NEXT_ID` plus `BPF_*_GET_FD_BY_ID`), since `bpftool` wasn't available.
+
+| Check | Result |
+|---|---|
+| 15.2 load test | ✅ `12 programs, 4 maps, 12 links` attached on 7.0.9, with a `vmlinux.h` generated on the host's 7.2.7 (CO-RE works) |
+| Tracepoint layouts | ✅ `module_load` has `__data_loc char[] name` at offset 12; `process_vm_readv/writev` have `pid` at offset 16 (`args[0]`), as the code assumes |
+| Status byte | ✅ mock game printed `testing build: 1, BPF-LSM hooks: 1` |
+| 2 `cheat` | ✅ blocked by the kretprobe; `PTRACE_ATTEMPT (mode 0xa)` logged |
+| 3 `process_vm_readv` | ✅ `Operation not permitted`; `PROCESS_VM_ACCESS` and `PTRACE_ATTEMPT (mode 0x12)` logged |
+| 4 `bpftrace` uprobe on the game | ✅ refused; `BPF_PROG_DENIED ... kprobe` logged |
+| 6/7 map/prog/link fds by id | ✅ all 4 maps, 12 programs and 12 links → `EPERM` (other system BPF objects stayed accessible); one `BPF_OBJ_DENIED` per object |
+| 8 attach-level access to the daemon from another root process | ✅ `/proc/<daemon>/mem` open and `gdb -p` both denied, each with a `DAEMON_ACCESS_DENIED` event (also covered by the root-only test `daemon_memory_closed_to_other_processes`) |
+| 8b read-level `/proc/<daemon>/{environ,maps}` | ⚠️ readable by root, by kernel design (see below) |
+| Signals | ✅ `TASK_KILL` for SIGSTOP (19), SIGCONT (18) and SIGTERM (15) |
+| 9 module load | ✅ `MODULE_LOAD: 'dummy'` logged |
+| 10 game exit | ✅ unprotected in both the kernel module and the BPF mirror |
+| 5 `bpftrace` after the game exits | ⚠️ inconclusive: a trivial script printed nothing, not even an error |
+
+### 15.5 `/proc` read-noise fix (2026-10-05)
+
+A later live test (Cheat Engine against a protected RecoilEngine, pid 2484) surfaced a
+noise problem: the kretprobe was correctly blocking Cheat Engine (`dmesg`: `Blocked
+memory/ptrace access ... by PID 3466`), but the log was also flooded with ~1234 alert
+lines from `htop` alone (plus `plasmashell`, `systemd-journald`), all from **read-only**
+access to the game's `/proc/<pid>/{cmdline,maps,status}`. The real attack lines were
+buried.
+
+Fix: the kretprobe now only denies (and logs) **attach-level** accesses
+(`PTRACE_MODE_ATTACH` — `/proc/<pid>/mem`, `process_vm_*`, ptrace attach; the only ones
+that can read memory). A bare `PTRACE_MODE_READ` is metadata and passes through. The BPF
+`PTRACE_ATTEMPT`/`DAEMON_ACCESS_DENIED` telemetry matches, and the kernel alert is now
+`pr_warn_ratelimited` with the mode in the message.
+
+Expected after the fix (to be confirmed on install, Part D of the plan):
+
+| Action while a game is protected | Expected |
+|---|---|
+| `htop`/`ps`/`pgrep`, `cat /proc/<game>/cmdline`, `head /proc/<game>/maps` | Succeed, **no** `dmesg` alert, **no** daemon `PTRACE_ATTEMPT` |
+| `dd if=/proc/<game>/mem`, `cheat`, Cheat Engine, `process_vm_readv` | Blocked, one ratelimited `Blocked memory access ... (ptrace mode 0x…)` line, daemon `PTRACE_ATTEMPT` |
+
+Note the earlier §15.4 "side observation" about `pgrep` is now fully resolved: those
+reads are READ-mode and no longer touched at all, not just unlogged.
+
+**Why 8b stays readable (traced on the VM).** A first run looked like the daemon
+ptrace gate was broken. Tracing each layer of the `cat /proc/<daemon>/environ` path
+with bpftrace showed otherwise:
+
+| Layer | `cat environ` (READ, mode 0x9) | `dd mem` (ATTACH, mode 0xa) |
+|---|---|---|
+| `security_ptrace_access_check` (our hook) | -1 (deny) | -1 (deny) |
+| `ptrace_may_access` | 0 (deny) | 0 (deny) |
+| `mm_access` | **valid mm (allowed)** | `-EACCES` |
+
+The cause is kernel code, not Quark. `mm_access()` calls `may_access_mm()`
+(`kernel/fork.c`, v7.0), which falls back to
+`(mode & PTRACE_MODE_READ) && perfmon_capable()` after `ptrace_may_access()` refuses.
+Any root process has `CAP_PERFMON`, so it gets READ-level access regardless of what an
+LSM said. `may_access_mm()` is inlined, so there's nothing to hook. The only
+workaround would be correlating the ptrace and capability hooks per task, which was
+judged too fragile. The same rule applies to protected games' `/proc/<pid>/maps`
+(`docs/features.md` §1.1).
+
