@@ -71,6 +71,19 @@ int quark_sdk_is_active(void);
 int quark_sdk_is_testing_build(void);
 
 /**
+ * Reports whether the daemon's BPF-LSM hooks are protecting this process: the
+ * gate on loading BPF tracing programs (which can read process memory without
+ * going through the kernel module's ptrace check), daemon self-protection, and
+ * telemetry. They're missing when the kernel was booted without `bpf` in its
+ * `lsm=` list, which a cheater controls on their own machine, so anything that
+ * requires full protection should check this alongside quark_sdk_is_active()
+ * and quark_sdk_is_testing_build().
+ * Returns 1 if active, 0 otherwise (including if Quark protection isn't active
+ * at all).
+ */
+int quark_sdk_is_bpf_lsm_active(void);
+
+/**
  * Copies the kernel module's version string (as reported by the daemon
  * during registration) into buf.
  * @param buf Destination buffer.

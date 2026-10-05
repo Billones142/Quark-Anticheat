@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+mod bpf;
+
 // First file descriptor systemd hands to a socket-activated service, per the
 // sd_listen_fds(3) protocol (fds 0/1/2 are stdio, activation fds start at 3).
 const SD_LISTEN_FDS_START: i32 = 3;
@@ -43,6 +45,26 @@ fn systemd_activated_listener() -> Option<UnixListener> {
 const CMD_REGISTER_GAME: u32 = 1;
 const CMD_REGISTER_VAR: u32 = 2;
 const CMD_UPDATE_VAR: u32 = 3;
+
+// CMD_REGISTER_GAME reply, mirrored by QUARK_REGISTER_ACK_SIZE in sdk/quark_sdk.c:
+// [ok:1][is_testing_build:1][version:16][bpf_lsm_active:1]
+const REGISTER_ACK_SIZE: usize = 19;
+
+fn build_register_ack(
+    kernel_ok: bool,
+    testing_build: bool,
+    version: &str,
+    bpf_lsm_active: bool,
+) -> [u8; REGISTER_ACK_SIZE] {
+    let mut ack = [0u8; REGISTER_ACK_SIZE];
+    ack[0] = kernel_ok as u8;
+    ack[1] = testing_build as u8;
+    let version_bytes = version.as_bytes();
+    let copy_len = version_bytes.len().min(16);
+    ack[2..2 + copy_len].copy_from_slice(&version_bytes[..copy_len]);
+    ack[18] = bpf_lsm_active as u8;
+    ack
+}
 
 #[derive(Debug, Clone)]
 struct MonitoredVar {
@@ -110,7 +132,7 @@ fn get_peer_pid(stream: &UnixStream) -> Option<i32> {
     }
 }
 
-fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
+fn handle_client(mut stream: UnixStream, bpf: Option<&bpf::QuarkBpf>) -> std::io::Result<()> {
     println!("[QUARK-DAEMON] Client connected.");
 
     // /tmp/quark.sock is world read/write (game processes need to reach it), so the
@@ -160,7 +182,7 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                     Some(p) => p,
                     None => {
                         eprintln!("[QUARK-DAEMON] Refusing REGISTER_GAME: no verified peer pid for this connection.");
-                        if let Err(e) = stream.write_all(&[0u8; 18]) {
+                        if let Err(e) = stream.write_all(&[0u8; REGISTER_ACK_SIZE]) {
                             eprintln!("[QUARK-DAEMON] Failed to send registration nack: {:?}", e);
                             return Err(e);
                         }
@@ -178,7 +200,7 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                 // 1. Tell kernel module to PROTECT this PID
                 println!("[QUARK-DAEMON] Registering PID {} to Ring 0 Module...", pid);
                 let output = Command::new("sudo")
-                    .args(&["./quark_daemon/quark_cli", "1", &pid.to_string()])
+                    .args(["./quark_daemon/quark_cli", "1", &pid.to_string()])
                     .output();
                 // quark_cli exits non-zero on any netlink failure (e.g. the kernel
                 // module isn't loaded, or it refused because it detected a VM), so
@@ -225,19 +247,37 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                     );
                 }
 
+                // Mirror the kernel module's decision into the BPF-LSM programs
+                // (src/bpf.rs) before acking, so the ack can say whether it worked.
+                // Non-fatal: the kretprobe is still the primary block; what's lost is
+                // the BPF-program-load gate and the telemetry for this pid.
+                let bpf_lsm_active = kernel_ok
+                    && match bpf {
+                        Some(bpf) => match bpf.protect(pid as u32) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                eprintln!("[QUARK-BPF] Warning: failed to mirror PID {} into BPF-LSM hooks: {}", pid, e);
+                                false
+                            }
+                        },
+                        None => false,
+                    };
+
                 // Tell the client whether Ring 0 protection is actually active (and
                 // what build reported it), so quark_sdk_init() can refuse to let the
                 // game run unprotected instead of assuming success just because the
                 // daemon answered, and so games/servers can later refuse to trust a
-                // testing build even when it reports "active".
-                let mut ack = [0u8; 18];
-                ack[0] = if kernel_ok { 1 } else { 0 };
-                ack[1] = if kernel_testing_build { 1 } else { 0 };
-                let version_bytes = kernel_version.as_bytes();
-                let copy_len = version_bytes.len().min(16);
-                ack[2..2 + copy_len].copy_from_slice(&version_bytes[..copy_len]);
+                // testing build, or a session without the BPF-LSM hooks, even when
+                // it reports "active".
+                let ack = build_register_ack(kernel_ok, kernel_testing_build, &kernel_version, bpf_lsm_active);
                 if let Err(e) = stream.write_all(&ack) {
                     eprintln!("[QUARK-DAEMON] Failed to send registration ack: {:?}", e);
+                    // Returning here skips the cleanup at the end of this function
+                    // (state was never set), so undo the BPF mirror now; otherwise
+                    // quark_protected_count stays too high.
+                    if bpf_lsm_active && let Some(bpf) = bpf {
+                        bpf.unprotect(pid as u32);
+                    }
                     return Err(e);
                 }
 
@@ -350,11 +390,10 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
                 ]);
                 
                 let mut lock = state.lock().unwrap();
-                if let Some(ref mut s) = *lock {
-                    if let Some(var) = s.variables.get_mut(&address) {
+                if let Some(ref mut s) = *lock
+                    && let Some(var) = s.variables.get_mut(&address) {
                         var.expected_value = new_value;
                     }
-                }
             }
             _ => {
                 println!("[QUARK-DAEMON] Unknown command: {}", command);
@@ -369,8 +408,11 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
         let pid = s.pid;
         println!("[QUARK-DAEMON] Unregistering PID {} from Ring 0 Module...", pid);
         let _ = Command::new("sudo")
-            .args(&["./quark_daemon/quark_cli", "2", &pid.to_string()])
+            .args(["./quark_daemon/quark_cli", "2", &pid.to_string()])
             .status();
+        if let Some(bpf) = bpf {
+            bpf.unprotect(pid as u32);
+        }
         println!("[QUARK-DAEMON] Monitoring session ended for PID {}.", pid);
     }
     
@@ -445,7 +487,7 @@ fn run_monitor_loop(state: Arc<Mutex<Option<QuarkState>>>) -> std::io::Result<()
                         println!("==================================================");
                         
                         println!("[QUARK ACTION] Terminating target process {} immediately...", pid);
-                        let _ = Command::new("kill").args(&["-9", &pid.to_string()]).status();
+                        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
                         
                         s.is_active = false;
                         break;
@@ -506,7 +548,7 @@ fn main() {
     // for clients regardless; this only affects the supplementary monitor thread.
     let own_pid = std::process::id();
     match Command::new("sudo")
-        .args(&["./quark_daemon/quark_cli", "3", &own_pid.to_string()])
+        .args(["./quark_daemon/quark_cli", "3", &own_pid.to_string()])
         .output()
     {
         Ok(out) if out.status.success() => {
@@ -526,10 +568,26 @@ fn main() {
         }
     }
 
+    // BPF-LSM hooks + telemetry (src/bpf.rs). Best-effort, like the trusted-monitor
+    // registration above: without `bpf` in the kernel's active LSM list (lsm= boot
+    // parameter) this fails, and only the kretprobe protection remains -- no gate on
+    // BPF tracing programs, no daemon self-protection, no telemetry.
+    let quark_bpf = match bpf::QuarkBpf::load_and_attach(own_pid) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            eprintln!(
+                "[QUARK-BPF] Warning: could not load/attach BPF-LSM hooks ({}). Is `bpf` listed in \
+                 /sys/kernel/security/lsm? Continuing with kretprobe-only protection.",
+                e
+            );
+            None
+        }
+    };
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(e) = handle_client(stream) {
+                if let Err(e) = handle_client(stream, quark_bpf.as_ref()) {
                     eprintln!("Error handling client: {:?}", e);
                 }
             }
@@ -537,5 +595,28 @@ fn main() {
                 eprintln!("Connection failed: {:?}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_ack_layout() {
+        let ack = build_register_ack(true, true, "0.5.0", true);
+        assert_eq!(ack.len(), REGISTER_ACK_SIZE);
+        assert_eq!(ack[0], 1);
+        assert_eq!(ack[1], 1);
+        assert_eq!(&ack[2..7], b"0.5.0");
+        assert!(ack[7..18].iter().all(|&b| b == 0));
+        assert_eq!(ack[18], 1);
+    }
+
+    #[test]
+    fn register_ack_truncates_long_version_without_touching_bpf_flag() {
+        let ack = build_register_ack(false, false, "0123456789abcdefXYZ", false);
+        assert_eq!(&ack[2..18], b"0123456789abcdef");
+        assert_eq!(ack[18], 0);
     }
 }

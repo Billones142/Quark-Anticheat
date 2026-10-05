@@ -28,3 +28,7 @@ kernel/quark_cli_hash.h
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Generated from the build host's kernel BTF (`make vmlinux`), consumed by
+# quark_daemon/src/bpf/quark.bpf.c -- ~160k lines, host-specific, not tracked.
+quark_daemon/src/bpf/vmlinux.h

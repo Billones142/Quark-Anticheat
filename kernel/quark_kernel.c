@@ -373,29 +373,45 @@ static void remove_protected_pid(pid_t pid) {
     spin_unlock_irqrestore(&quark_lock, flags);
 }
 
+// Saved from ptrace_may_access(task, mode)'s arguments in the entry handler and read
+// back in the return handler. We keep the access mode too, not just the target task:
+// only PTRACE_MODE_ATTACH can actually read another process's memory (/proc/<pid>/mem,
+// process_vm_readv/writev, ptrace attach), while PTRACE_MODE_READ alone is harmless
+// metadata (/proc/<pid>/{cmdline,maps,status}) that ps/htop/journald read constantly.
+// Blocking every mode flooded dmesg with alerts for those routine reads (see
+// docs/vm_test_environment.md) and needlessly broke process listings for protected
+// games; only the ATTACH case is a real threat.
+struct quark_pma_call {
+    struct task_struct *task;
+    unsigned int mode;
+};
+
 /*
- * Entry handler: runs before ptrace_may_access executes.
- * We extract the first argument (struct task_struct *task) and save it in ri->data.
- * Under x86_64, the first argument is passed in the DI register (regs->di).
+ * Entry handler: runs before ptrace_may_access executes. Under x86_64 the first two
+ * arguments are in DI (task) and SI (mode).
  */
 static int ptrace_may_access_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct quark_pma_call *call = (struct quark_pma_call *)ri->data;
 #ifdef CONFIG_X86_64
-    struct task_struct *task = (struct task_struct *)regs->di;
-    *((struct task_struct **)ri->data) = task;
+    call->task = (struct task_struct *)regs->di;
+    call->mode = (unsigned int)regs->si;
 #else
-    *((struct task_struct **)ri->data) = NULL;
+    call->task = NULL;
+    call->mode = 0;
 #endif
     return 0;
 }
 
 /*
  * Return handler: runs after ptrace_may_access finishes.
- * We inspect if the target task is protected. If so, and the caller is not
- * the process itself or the one authenticated trusted monitor, we override
- * the return value (rax) to 0 (false/access denied).
+ * We inspect if the target task is protected. If so, the caller is not the process
+ * itself or the one authenticated trusted monitor, AND this is an attach-level access
+ * (the only kind that can read memory), we override the return value (rax) to 0
+ * (false/access denied). Read-only metadata accesses are left untouched.
  */
 static int ptrace_may_access_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    struct task_struct *task = *((struct task_struct **)ri->data);
+    struct quark_pma_call *call = (struct quark_pma_call *)ri->data;
+    struct task_struct *task = call->task;
     pid_t target_pid;
     pid_t parent_pid;
 
@@ -426,9 +442,16 @@ static int ptrace_may_access_ret_handler(struct kretprobe_instance *ri, struct p
         // first here and found, live, to let `cheat` through right along with the
         // daemon -- a real regression, not just a test artifact, since a cheat
         // process elevated to root by any means would have sailed through too.
-        if (target_pid != parent_pid && parent_pid != trusted_monitor_pid) {
-            pr_warn("[QUARK-KERNEL ALERT] Blocked memory/ptrace access to protected process %d by PID %d!\n",
-                    target_pid, parent_pid);
+        // PTRACE_MODE_ATTACH is set for /proc/<pid>/mem, process_vm_*, and ptrace
+        // attach -- everything that can read the target's memory. A bare
+        // PTRACE_MODE_READ (no ATTACH) is just metadata and is allowed through, so
+        // normal tooling keeps working and dmesg isn't flooded. Ratelimited because a
+        // real attacker (e.g. Cheat Engine) polls, and the daemon's BPF telemetry is
+        // the authoritative per-attempt record anyway (docs/features.md §1.6).
+        if (target_pid != parent_pid && parent_pid != trusted_monitor_pid &&
+            (call->mode & PTRACE_MODE_ATTACH)) {
+            pr_warn_ratelimited("[QUARK-KERNEL ALERT] Blocked memory access to protected process %d by PID %d (ptrace mode 0x%x)!\n",
+                                target_pid, parent_pid, call->mode);
 
 #ifdef CONFIG_X86_64
             // Override rax register (return value) to 0 (false)
@@ -442,7 +465,7 @@ static int ptrace_may_access_ret_handler(struct kretprobe_instance *ri, struct p
 static struct kretprobe quark_kretprobe = {
     .handler = ptrace_may_access_ret_handler,
     .entry_handler = ptrace_may_access_entry_handler,
-    .data_size = sizeof(struct task_struct *),
+    .data_size = sizeof(struct quark_pma_call),
     .maxactive = 64,
 };
 

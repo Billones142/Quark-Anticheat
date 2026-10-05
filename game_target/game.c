@@ -41,8 +41,8 @@ int main(void) {
     } else {
         char version[32];
         quark_sdk_get_version(version, sizeof(version));
-        printf("[GAME] Quark kernel version: %s (testing build: %d)\n",
-               version, quark_sdk_is_testing_build());
+        printf("[GAME] Quark kernel version: %s (testing build: %d, BPF-LSM hooks: %d)\n",
+               version, quark_sdk_is_testing_build(), quark_sdk_is_bpf_lsm_active());
 
         // 3. Register target variables
         quark_sdk_register_var(&health, sizeof(health), "health");
